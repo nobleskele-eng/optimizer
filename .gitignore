@@ -1,0 +1,19 @@
+# Bundled ffmpeg build: 227 MB each, over GitHub's 100 MB file limit.
+# Get them from https://www.gyan.dev/ffmpeg/builds/ (see README.txt).
+ffmpeg.exe
+ffprobe.exe
+
+# Input/output videos and audio
+optimized/
+*.mp4
+*.mov
+*.m4v
+*.mkv
+*.webm
+*.mp3
+*.m4a
+*.aac
+*.wav
+
+# Local Windows shortcuts
+*.lnk
