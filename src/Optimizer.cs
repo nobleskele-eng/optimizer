@@ -702,14 +702,14 @@ namespace QualityOptimizer
         // AAC-LC, with a SECOND audio track that duplicates the first. No junk
         // track, no trailing bytes, no header tricks. This engine reproduces
         // that structure with ffmpeg alone (no container surgery).
-        public static int CloneMbps = 15;        // video bitrate for the re-encode
-        public static bool CloneLimit1080 = true; // downscale to <=1080p (matches the proven file)
+        public static int CloneMbps = 15;              // video bitrate for the re-encode
+        public static string CloneMaxBox = "1080:1920"; // scale box W:H (confirmed 1080p); "2160:3840" for 4K; "" keeps source res
 
         static string CloneScale()
         {
-            // Fit inside a 1080x1920 box, keep aspect, never upscale, even dims.
-            return CloneLimit1080
-                ? " -vf scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2"
+            // Fit inside the box, keep aspect, never upscale, even dims.
+            return CloneMaxBox.Length > 0
+                ? " -vf scale=" + CloneMaxBox + ":force_original_aspect_ratio=decrease:force_divisible_by=2"
                 : "";
         }
 
@@ -1068,7 +1068,8 @@ namespace QualityOptimizer
             string[] wh = so.Trim().Split(',');
             int w = wh.Length > 0 ? ParseInt(wh[0]) : 0, h = wh.Length > 1 ? ParseInt(wh[1]) : 0;
             long lo = Math.Min(w, h), hi = Math.Max(w, h);
-            r.Add(new VCheck("Resolution <= 1080p", hi > 0 && hi <= 1920 && lo <= 1080, w + "x" + h));
+            string resNote = w + "x" + h + (hi <= 1920 ? " (1080p; confirmed served original)" : " (above 1080p; NOT upload-tested)");
+            r.Add(new VCheck("Resolution within 4K", hi > 0 && hi <= 3840 && lo <= 2160, resNote));
 
             // 4. video decodes clean (no corruption from the re-encode)
             Run(ffmpeg, "-nostdin -v error -i " + q + " -map 0:v:0 -f null -", out so, out se);
@@ -1140,11 +1141,12 @@ namespace QualityOptimizer
         CheckBox reencode;
         NumericUpDown mbps;
         CheckBox cloneBox;
+        CheckBox res4k;
 
         public MainForm()
         {
             Text = "TikTok Quality Optimizer";
-            Width = 560; Height = 676;
+            Width = 560; Height = 704;
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(24, 24, 28);
             AllowDrop = true;
@@ -1221,36 +1223,43 @@ namespace QualityOptimizer
             Controls.Add(cloneBox);
 
             Label cloneL = new Label();
-            cloneL.Text = "Confirmed working 2026-11; the junk method below no longer works. Re-encodes (one generation), caps at 1080p.";
+            cloneL.Text = "Confirmed working 2026-11; the junk method below no longer works. Re-encodes (one generation).";
             cloneL.ForeColor = Color.FromArgb(150, 150, 160);
             cloneL.Font = new Font("Segoe UI", 8.5F);
             cloneL.SetBounds(42, 316, 490, 18);
             Controls.Add(cloneL);
 
+            res4k = new CheckBox();
+            res4k.Text = "Allow up to 4K  (default 1080p — 4K is NOT upload-tested)";
+            res4k.ForeColor = Color.FromArgb(200, 200, 210);
+            res4k.Font = new Font("Segoe UI", 9F);
+            res4k.SetBounds(42, 336, 490, 22);
+            Controls.Add(res4k);
+
             reencode = new CheckBox();
             reencode.Text = "Set video bitrate";
             reencode.ForeColor = Color.FromArgb(200, 200, 210);
             reencode.Font = new Font("Segoe UI", 9.5F);
-            reencode.SetBounds(24, 340, 130, 24);
+            reencode.SetBounds(24, 362, 130, 24);
             reencode.CheckedChanged += delegate { mbps.Enabled = reencode.Checked; };
             Controls.Add(reencode);
 
             mbps = new NumericUpDown();
             mbps.Minimum = 8; mbps.Maximum = 50; mbps.Value = 15;
             mbps.Font = new Font("Segoe UI", 9.5F);
-            mbps.SetBounds(156, 340, 50, 24);
+            mbps.SetBounds(156, 362, 50, 24);
             mbps.Enabled = false;
             Controls.Add(mbps);
 
             Label mbpsL = new Label();
-            mbpsL.Text = "Mbps (new method default 15; unticked = 15 / legacy copy)";
+            mbpsL.Text = "Mbps (default 15; use ~30-40 for 4K)";
             mbpsL.ForeColor = Color.FromArgb(150, 150, 160);
             mbpsL.Font = new Font("Segoe UI", 9F);
-            mbpsL.SetBounds(230, 343, 304, 20);
+            mbpsL.SetBounds(230, 365, 304, 20);
             Controls.Add(mbpsL);
 
             bar = new ProgressBar();
-            bar.SetBounds(24, 372, 500, 12);
+            bar.SetBounds(24, 394, 500, 12);
             bar.Style = ProgressBarStyle.Marquee;
             bar.Visible = false;
             Controls.Add(bar);
@@ -1259,7 +1268,7 @@ namespace QualityOptimizer
             status.Text = "";
             status.ForeColor = Color.FromArgb(160, 200, 160);
             status.Font = new Font("Segoe UI", 9.5F);
-            status.SetBounds(24, 390, 500, 20);
+            status.SetBounds(24, 412, 500, 20);
             Controls.Add(status);
 
             report = new TextBox();
@@ -1270,7 +1279,7 @@ namespace QualityOptimizer
             report.ForeColor = Color.FromArgb(200, 210, 200);
             report.Font = new Font("Consolas", 9F);
             report.BorderStyle = BorderStyle.FixedSingle;
-            report.SetBounds(24, 414, 500, 208);
+            report.SetBounds(24, 436, 500, 208);
             Controls.Add(report);
 
             if (!Tools.Available())
@@ -1352,6 +1361,7 @@ namespace QualityOptimizer
 
             Tools.ReencodeMbps = reencode.Checked ? (int)mbps.Value : 0;
             Tools.CloneMbps = reencode.Checked ? (int)mbps.Value : 15;
+            Tools.CloneMaxBox = res4k.Checked ? "2160:3840" : "1080:1920";
             bool clone = cloneBox.Checked;
             Busy(true);
             SetStatus("Working...", false);
@@ -1447,6 +1457,7 @@ namespace QualityOptimizer
             reencode.Enabled = !on;
             mbps.Enabled = !on && reencode.Checked;
             cloneBox.Enabled = !on;
+            res4k.Enabled = !on;
         }
 
         void SetReport(string text)
@@ -1496,6 +1507,20 @@ namespace QualityOptimizer
             // A leading -bitrate N also sets the clone engine's video bitrate,
             // e.g. optimizer.exe -bitrate 25 -clone in.mov out.mp4
             if (clone && Tools.ReencodeMbps > 0) Tools.CloneMbps = Tools.ReencodeMbps;
+
+            // Optional resolution for the clone engine (default 1080p, confirmed).
+            // -4k caps at 2160x3840; -native keeps the source resolution. Both are
+            // UNTESTED on TikTok (the proven method is 1080p).
+            if (args.Length >= 1 && (args[0] == "-4k" || args[0] == "/4k"))
+            {
+                Tools.CloneMaxBox = "2160:3840";
+                string[] rest = new string[args.Length - 1]; Array.Copy(args, 1, rest, 0, rest.Length); args = rest;
+            }
+            else if (args.Length >= 1 && (args[0] == "-native" || args[0] == "/native"))
+            {
+                Tools.CloneMaxBox = "";
+                string[] rest = new string[args.Length - 1]; Array.Copy(args, 1, rest, 0, rest.Length); args = rest;
+            }
 
             // Verify only:  Optimizer.exe -verify <file>
             if (args.Length >= 1 && (args[0] == "-verify" || args[0] == "/verify"))
