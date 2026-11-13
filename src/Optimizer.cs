@@ -23,6 +23,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -514,35 +515,180 @@ namespace QualityOptimizer
             stsc.Payload = ns;
         }
 
-        // Extend a track's declared duration by `tailMedia` media ticks, so the
-        // appended tail samples fall within the track (mdhd), its presentation
-        // (tkhd) and its edit list (elst). Without this ffmpeg clamps the track
-        // to the old duration and never reads the tail.
+        // Where the 16-frame tail sits, and what it does to playback.
+        //   V3            The upload-confirmed layout (CLAUDE.md, v3): tail appended
+        //                 after the song, audio edit lists dropped and track/movie
+        //                 durations stretched over it. Players then play the tail:
+        //                 ~0.4 s of silence with no picture at the end of every file.
+        //   KeepEditLists V3 minus those two additions: same tail, same mismatch,
+        //                 but the audio edit lists and track/movie durations stay as
+        //                 ffmpeg wrote them, so playback stops at the end of the
+        //                 song. ffmpeg-style readers then skip the tail frames.
+        //                 NOT upload-tested.
+        //   Front         Tail placed BEFORE the song and hidden inside the edit
+        //                 list's encoder-delay skip: readers still receive and
+        //                 decode every tail frame (then discard the output), and
+        //                 nothing plays after the song. NOT upload-tested.
+        public enum TailLayout { V3, KeepEditLists, Front }
+
+        // Extend a track's media duration (mdhd) by `tailMedia` ticks so it
+        // covers every sample, tail included. Returns the media timescale.
+        static uint ExtendMediaDuration(Box trak, long tailMedia)
+        {
+            byte[] m = trak.Kid("mdia").Kid("mdhd").Payload;
+            if (m[0] == 1) { BE.WU64(m, 24, BE.RU64(m, 24) + (ulong)tailMedia); return BE.RU32(m, 20); }
+            BE.WU32(m, 16, BE.RU32(m, 16) + (uint)tailMedia);
+            return BE.RU32(m, 12);
+        }
+
+        // V3 only: also stretch the presentation duration (tkhd) over the tail.
+        // With the edit lists gone, this is what makes ffmpeg and players play
+        // the appended tail (and what creates the silent end).
         static void ExtendTrackDuration(Box trak, long tailMedia, uint movieTs)
         {
-            Box mdhd = trak.Kid("mdia").Kid("mdhd");
-            byte[] m = mdhd.Payload;
-            uint mts;
-            if (m[0] == 1) { mts = BE.RU32(m, 20); BE.WU64(m, 24, BE.RU64(m, 24) + (ulong)tailMedia); }
-            else { mts = BE.RU32(m, 12); BE.WU32(m, 16, BE.RU32(m, 16) + (uint)tailMedia); }
-
+            uint mts = ExtendMediaDuration(trak, tailMedia);
             ulong tailMovie = (mts == 0) ? 0 : (ulong)tailMedia * movieTs / mts;
-
-            Box tkhd = trak.Kid("tkhd");
-            byte[] q = tkhd.Payload;
+            byte[] q = trak.Kid("tkhd").Payload;
             if (q[0] == 1) BE.WU64(q, 28, BE.RU64(q, 28) + tailMovie);
             else BE.WU32(q, 20, BE.RU32(q, 20) + (uint)tailMovie);
+        }
 
+        // Give a track a one-entry edit list (play the whole track from media
+        // time 0) if it has none. ffmpeg normally writes one for AAC already.
+        static void EnsureEditList(Box trak)
+        {
+            if (trak.Kid("edts") != null) return;
+            byte[] q = trak.Kid("tkhd").Payload;
+            bool v1 = (q[0] == 1);
+            byte[] e = new byte[v1 ? 36 : 28];
+            BE.WU32(e, 0, (uint)e.Length);
+            e[4] = (byte)'e'; e[5] = (byte)'l'; e[6] = (byte)'s'; e[7] = (byte)'t';
+            e[8] = (byte)(v1 ? 1 : 0);
+            BE.WU32(e, 12, 1);                                      // entry_count
+            if (v1) { BE.WU64(e, 16, BE.RU64(q, 28)); BE.WU64(e, 24, 0); BE.WU32(e, 32, 0x00010000); }
+            else { BE.WU32(e, 16, BE.RU32(q, 20)); BE.WU32(e, 20, 0); BE.WU32(e, 24, 0x00010000); }
+            Box edts = new Box();
+            edts.Type = "edts"; edts.Container = false; edts.Payload = e;   // edts is kept as a leaf (its payload is the elst box)
+            trak.Kids.Insert(trak.Kids.IndexOf(trak.Kid("tkhd")) + 1, edts);
+        }
+
+        // Front layout: move every edit's start later by `ticks` media ticks, so
+        // the prepended tail falls inside the skipped start (like encoder delay).
+        static void ShiftEditStart(Box trak, long ticks)
+        {
             Box edts = trak.Kid("edts");
-            if (edts != null)
+            if (edts == null) throw new Exception("Audio track has no edit list.");
+            byte[] e = edts.Payload;                                // the elst box: size, 'elst', ver/flags, count, entries
+            if (e.Length < 16 || BE.Ascii(e, 4, 4) != "elst") throw new Exception("Unexpected audio edit list.");
+            bool v1 = (e[8] == 1);
+            int n = (int)BE.RU32(e, 12), w = v1 ? 20 : 12;
+            for (int i = 0; i < n; i++)
             {
-                Box elst = edts.Kid("elst");
-                if (elst != null && BE.RU32(elst.Payload, 4) >= 1)
+                int o = 16 + i * w + (v1 ? 8 : 4);                  // media_time
+                if (v1)
                 {
-                    byte[] e = elst.Payload;
-                    if (e[0] == 1) BE.WU64(e, 8, BE.RU64(e, 8) + tailMovie);
-                    else BE.WU32(e, 8, BE.RU32(e, 8) + (uint)tailMovie);
+                    long mt = (long)BE.RU64(e, o);
+                    if (mt != -1) BE.WU64(e, o, (ulong)(mt + ticks));
                 }
+                else
+                {
+                    int mt = (int)BE.RU32(e, o);
+                    if (mt != -1) BE.WU32(e, o, (uint)(mt + ticks));
+                }
+            }
+        }
+
+        // Front layout: insert the TAIL_FRAMES-frame tail (each `sampleSize`
+        // bytes, 1024 ticks) at the START of the track as two chunks of half the
+        // frames each, mirroring AppendTail: the first half uses description 1,
+        // the second half `secondHalfDesc`.
+        static void PrependTail(Box trak, long tailOffset, uint sampleSize, int secondHalfDesc)
+        {
+            Box stbl = trak.Kid("mdia").Kid("minf").Kid("stbl");
+            Box stsz = stbl.Kid("stsz");
+            Box stts = stbl.Kid("stts");
+            Box stsc = stbl.Kid("stsc");
+            Box stco = stbl.Kid("stco");
+            Box co64 = stbl.Kid("co64");
+            if (stsz == null || stts == null || stsc == null || (stco == null && co64 == null))
+                throw new Exception("Audio sample tables incomplete for tail insert.");
+            if (stbl.Kid("stss") != null || stbl.Kid("ctts") != null)
+                throw new Exception("Audio track has sync/composition tables; the front layout does not support this file.");
+            int half = TAIL_FRAMES / 2;
+
+            // stsz: TAIL_FRAMES entries of sampleSize, then the existing sizes
+            byte[] zp = stsz.Payload;
+            if (BE.RU32(zp, 4) != 0) throw new Exception("Uniform stsz unexpected on audio track.");
+            int zc = (int)BE.RU32(zp, 8);
+            byte[] nz = new byte[zp.Length + TAIL_FRAMES * 4];
+            Array.Copy(zp, 0, nz, 0, 12);
+            BE.WU32(nz, 8, (uint)(zc + TAIL_FRAMES));
+            for (int i = 0; i < TAIL_FRAMES; i++) BE.WU32(nz, 12 + i * 4, sampleSize);
+            Array.Copy(zp, 12, nz, 12 + TAIL_FRAMES * 4, zp.Length - 12);
+            stsz.Payload = nz;
+
+            // stts: a first run [TAIL_FRAMES, 1024], then the existing runs
+            byte[] tp = stts.Payload;
+            int tc = (int)BE.RU32(tp, 4);
+            byte[] nt = new byte[tp.Length + 8];
+            Array.Copy(tp, 0, nt, 0, 8);
+            BE.WU32(nt, 4, (uint)(tc + 1));
+            BE.WU32(nt, 8, (uint)TAIL_FRAMES);
+            BE.WU32(nt, 12, 1024);
+            Array.Copy(tp, 8, nt, 16, tp.Length - 8);
+            stts.Payload = nt;
+
+            // stco/co64: the two tail chunk offsets first
+            bool is64 = (co64 != null);
+            Box chunkBox = is64 ? co64 : stco;
+            byte[] cp = chunkBox.Payload;
+            int cc = (int)BE.RU32(cp, 4), ew = is64 ? 8 : 4;
+            long off2 = tailOffset + (long)half * sampleSize;
+            byte[] nc = new byte[cp.Length + 2 * ew];
+            Array.Copy(cp, 0, nc, 0, 8);
+            BE.WU32(nc, 4, (uint)(cc + 2));
+            if (is64) { BE.WU64(nc, 8, (ulong)tailOffset); BE.WU64(nc, 16, (ulong)off2); }
+            else
+            {
+                if (off2 > uint.MaxValue) throw new Exception("File too large for 32-bit offsets.");
+                BE.WU32(nc, 8, (uint)tailOffset); BE.WU32(nc, 12, (uint)off2);
+            }
+            Array.Copy(cp, 8, nc, 8 + 2 * ew, cp.Length - 8);
+            chunkBox.Payload = nc;
+
+            // stsc: [1, half, desc 1] [2, half, secondHalfDesc], then the existing
+            // entries with their first_chunk moved up by 2
+            byte[] sp = stsc.Payload;
+            int sc = (int)BE.RU32(sp, 4);
+            byte[] ns = new byte[sp.Length + 24];
+            Array.Copy(sp, 0, ns, 0, 8);
+            BE.WU32(ns, 4, (uint)(sc + 2));
+            BE.WU32(ns, 8, 1); BE.WU32(ns, 12, (uint)half); BE.WU32(ns, 16, 1);
+            BE.WU32(ns, 20, 2); BE.WU32(ns, 24, (uint)half); BE.WU32(ns, 28, (uint)secondHalfDesc);
+            for (int i = 0; i < sc; i++)
+            {
+                int s = 8 + i * 12, d = 32 + i * 12;
+                BE.WU32(ns, d, BE.RU32(sp, s) + 2);
+                Array.Copy(sp, s + 4, ns, d + 4, 8);
+            }
+            stsc.Payload = ns;
+
+            // sbgp (ffmpeg's AAC 'roll' group): the tail frames join the first
+            // group, so the real frames keep their own group membership
+            Box sbgp = stbl.Kid("sbgp");
+            if (sbgp != null)
+            {
+                byte[] gp = sbgp.Payload;
+                int hdr = (gp[0] == 1) ? 16 : 12;                   // ver/flags, grouping_type, [param], entry_count
+                int ec = (int)BE.RU32(gp, hdr - 4);
+                uint gi = (ec > 0) ? BE.RU32(gp, hdr + 4) : 0;
+                byte[] ng = new byte[gp.Length + 8];
+                Array.Copy(gp, 0, ng, 0, hdr);
+                BE.WU32(ng, hdr - 4, (uint)(ec + 1));
+                BE.WU32(ng, hdr, (uint)TAIL_FRAMES);
+                BE.WU32(ng, hdr + 4, gi);
+                Array.Copy(gp, hdr, ng, hdr + 8, gp.Length - hdr);
+                sbgp.Payload = ng;
             }
         }
 
@@ -555,8 +701,9 @@ namespace QualityOptimizer
         // Turn a clean single-audio H.264 base (moov LAST) into the RTXFury v2
         // structure: a second audio track that shares the first's bytes, plus a
         // tail of silent frames in a second mdat referenced by both tracks. The
-        // main mdat is untouched, so no chunk offsets need shifting.
-        public static byte[] BuildCloneContainer(byte[] data)
+        // main mdat is untouched, so no chunk offsets need shifting. `layout`
+        // picks where the tail sits (see TailLayout).
+        public static byte[] BuildCloneContainer(byte[] data, TailLayout layout)
         {
             List<Top> top = TopLevel(data);
             int moovI = -1;
@@ -576,6 +723,14 @@ namespace QualityOptimizer
             }
             if (audio == null) throw new Exception("No audio track found after normalization.");
 
+            Box mvhd = moov.Kid("mvhd");
+            byte[] mp = mvhd.Payload;
+            uint movieTs = (mp[0] == 1) ? BE.RU32(mp, 20) : BE.RU32(mp, 12);
+
+            // The no-gap layouts keep the audio edit list; make sure there is
+            // one before cloning, so the clone track gets the same one.
+            if (layout != TailLayout.V3) EnsureEditList(audio);
+
             // Clone the audio track; the clone shares the real audio bytes
             // (it keeps the source track's chunk offsets).
             Box t3 = audio.Clone();
@@ -584,29 +739,50 @@ namespace QualityOptimizer
             int ai = moov.Kids.IndexOf(audio);
             moov.Kids.Insert(ai + 1, t3);
 
-            // Drop the audio edit lists: ffmpeg's AAC edit list (encoder-delay
-            // skip) would otherwise trim the appended tail out of the demuxed
-            // stream, so the tail must not sit behind an edit. Costs only the
-            // ~23 ms priming skip on the real audio (imperceptible).
-            audio.Kids.RemoveAll(delegate(Box x) { return x.Type == "edts"; });
-            t3.Kids.RemoveAll(delegate(Box x) { return x.Type == "edts"; });
+            // V3 only: drop the audio edit lists. ffmpeg's AAC edit list
+            // (encoder-delay skip) would otherwise trim the appended tail out of
+            // the demuxed stream. Side effects: audio plays ~23 ms late, and the
+            // tail plays as ~0.4 s of silence after the last video frame.
+            if (layout == TailLayout.V3)
+            {
+                audio.Kids.RemoveAll(delegate(Box x) { return x.Type == "edts"; });
+                t3.Kids.RemoveAll(delegate(Box x) { return x.Type == "edts"; });
+            }
 
             // A second mdat right after the main data holds the shared tail.
             // The real audio track gets a second sample description and tags the
             // tail's second half with it; the clone track tags the same bytes
-            // with description 1 (the RTXFury codec-config mismatch).
+            // with description 1 (the RTXFury codec-config mismatch). All three
+            // layouts keep this mismatch; only the tail's position and timing differ.
             long mdat2Start = moovT.Start;
             long tailOffset = mdat2Start + 8;
-            AddSecondAudioDesc(audio);
-            AppendTail(audio, tailOffset, (uint)SILENT_AAC.Length, 1024, 2);
-            AppendTail(t3, tailOffset, (uint)SILENT_AAC.Length, 1024, 1);
-
-            Box mvhd = moov.Kid("mvhd");
-            byte[] mp = mvhd.Payload;
-            uint movieTs = (mp[0] == 1) ? BE.RU32(mp, 20) : BE.RU32(mp, 12);
             long tailMedia = (long)TAIL_FRAMES * 1024;
-            ExtendTrackDuration(audio, tailMedia, movieTs);
-            ExtendTrackDuration(t3, tailMedia, movieTs);
+            AddSecondAudioDesc(audio);
+            if (layout == TailLayout.Front)
+            {
+                PrependTail(audio, tailOffset, (uint)SILENT_AAC.Length, 2);
+                PrependTail(t3, tailOffset, (uint)SILENT_AAC.Length, 1);
+                ShiftEditStart(audio, tailMedia);
+                ShiftEditStart(t3, tailMedia);
+            }
+            else
+            {
+                AppendTail(audio, tailOffset, (uint)SILENT_AAC.Length, 1024, 2);
+                AppendTail(t3, tailOffset, (uint)SILENT_AAC.Length, 1024, 1);
+            }
+
+            if (layout == TailLayout.V3)
+            {
+                ExtendTrackDuration(audio, tailMedia, movieTs);
+                ExtendTrackDuration(t3, tailMedia, movieTs);
+            }
+            else
+            {
+                // Media durations cover the tail; presentation (tkhd/mvhd) stays
+                // at the song's length, as ffmpeg wrote it.
+                ExtendMediaDuration(audio, tailMedia);
+                ExtendMediaDuration(t3, tailMedia);
+            }
 
             // Movie duration = longest track (now the audio tracks with the tail).
             ulong maxDur = 0;
@@ -634,6 +810,7 @@ namespace QualityOptimizer
     class VCheck
     {
         public string Name; public bool Pass; public string Detail;
+        public bool Info;   // informational line: shown as [INFO], never fails the verdict
         public VCheck(string n, bool p, string d) { Name = n; Pass = p; Detail = d; }
     }
 
@@ -704,6 +881,14 @@ namespace QualityOptimizer
         // that structure with ffmpeg alone (no container surgery).
         public static int CloneMbps = 15;              // video bitrate for the re-encode
         public static string CloneMaxBox = "1080:1920"; // scale box W:H (confirmed 1080p); "2160:3840" for 4K; "" keeps source res
+        public static Mp4.TailLayout CloneTail = Mp4.TailLayout.V3; // V3 = upload-confirmed; the others remove the end gap (untested)
+
+        public static string TailName(Mp4.TailLayout t)
+        {
+            if (t == Mp4.TailLayout.KeepEditLists) return "keep edit lists (no end gap)";
+            if (t == Mp4.TailLayout.Front) return "silent frames at start (no end gap)";
+            return "v3";
+        }
 
         static string CloneScale()
         {
@@ -774,7 +959,7 @@ namespace QualityOptimizer
             // Container surgery: add the byte-sharing clone track + second-mdat tail.
             status("Cloning the audio track (shared bytes + tail)...");
             byte[] baseData = File.ReadAllBytes(tmp);
-            byte[] outData = Mp4.BuildCloneContainer(baseData);
+            byte[] outData = Mp4.BuildCloneContainer(baseData, CloneTail);
             File.WriteAllBytes(tmp, outData);
             return tmp;
         }
@@ -898,6 +1083,13 @@ namespace QualityOptimizer
         {
             int v;
             if (int.TryParse((s == null ? "" : s).Trim(), out v)) return v;
+            return 0;
+        }
+        // ffprobe always prints a dot decimal; parse it the same on every Windows locale.
+        static double ParseDouble(string s)
+        {
+            double v;
+            if (double.TryParse((s == null ? "" : s).Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out v)) return v;
             return 0;
         }
 
@@ -1043,8 +1235,10 @@ namespace QualityOptimizer
 
         // Checks for a "clone" output: a well-formed H.264 file with two valid
         // audio tracks, the second a duplicate of the first. (The eight junk
-        // checks above do not apply to this method.)
-        public static List<VCheck> VerifyClone(string file)
+        // checks above do not apply to this method.) requireNoGap makes the
+        // end-gap line a real check (for the no-gap tail layouts); otherwise it
+        // is informational, since the v3 layout always leaves a ~0.4 s gap.
+        public static List<VCheck> VerifyClone(string file, bool requireNoGap)
         {
             string ffprobe = Find("ffprobe");
             string ffmpeg = Find("ffmpeg");
@@ -1114,6 +1308,23 @@ namespace QualityOptimizer
             catch { ok7 = false; }
             r.Add(new VCheck("Valid MP4 container", ok7, order));
 
+            // 8. end gap: how long the file keeps running after the last video
+            //    frame (silence + black or frozen picture before the loop)
+            Run(ffprobe, "-v error -show_entries format=duration -of csv=p=0 " + q, out so, out se);
+            double fdur = ParseDouble(so);
+            Run(ffprobe, "-v error -select_streams v:0 -show_entries stream=duration -of csv=p=0 " + q, out so, out se);
+            double vdur = ParseDouble(so);
+            bool known = fdur > 0 && vdur > 0;
+            double gap = fdur - vdur;
+            string gd = known
+                ? String.Format(CultureInfo.InvariantCulture, "file runs {0:0.000} s past the last video frame", gap)
+                : "could not read the durations";
+            if (requireNoGap) gd += " (want 0.100 or less)";
+            else if (known && gap > 0.1) gd += " (normal for the v3 layout)";
+            VCheck g = new VCheck("End gap", known && gap <= 0.1, gd);
+            g.Info = !requireNoGap;
+            r.Add(g);
+
             return r;
         }
 
@@ -1123,8 +1334,9 @@ namespace QualityOptimizer
             StringBuilder sb = new StringBuilder();
             foreach (VCheck c in checks)
             {
-                if (!c.Pass) allPass = false;
-                sb.AppendLine((c.Pass ? "[PASS] " : "[WARN] ") + c.Name.PadRight(28) + "  " + c.Detail);
+                if (!c.Pass && !c.Info) allPass = false;
+                string tag = c.Info ? "[INFO] " : (c.Pass ? "[PASS] " : "[WARN] ");
+                sb.AppendLine(tag + c.Name.PadRight(28) + "  " + c.Detail);
             }
             return sb.ToString();
         }
@@ -1142,11 +1354,12 @@ namespace QualityOptimizer
         NumericUpDown mbps;
         CheckBox cloneBox;
         CheckBox res4k;
+        ComboBox tailMode;
 
         public MainForm()
         {
             Text = "TikTok Quality Optimizer";
-            Width = 560; Height = 704;
+            Width = 560; Height = 730;
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(24, 24, 28);
             AllowDrop = true;
@@ -1236,18 +1449,38 @@ namespace QualityOptimizer
             res4k.SetBounds(42, 336, 490, 22);
             Controls.Add(res4k);
 
+            // End-gap fix: where the clone engine puts its 16 silent tail frames.
+            // Item order matches Mp4.TailLayout (V3, KeepEditLists, Front).
+            Label tailL = new Label();
+            tailL.Text = "End-gap fix:";
+            tailL.ForeColor = Color.FromArgb(200, 200, 210);
+            tailL.Font = new Font("Segoe UI", 9F);
+            tailL.SetBounds(42, 363, 86, 20);
+            Controls.Add(tailL);
+
+            tailMode = new ComboBox();
+            tailMode.DropDownStyle = ComboBoxStyle.DropDownList;
+            tailMode.Font = new Font("Segoe UI", 9F);
+            tailMode.Items.Add("Off - v3 (upload-confirmed, ~0.4 s silent end)");
+            tailMode.Items.Add("Keep edit lists - no end gap (NOT upload-tested)");
+            tailMode.Items.Add("Silent frames at start - no end gap (NOT upload-tested)");
+            tailMode.SelectedIndex = 0;
+            tailMode.SetBounds(130, 360, 394, 24);
+            Controls.Add(tailMode);
+            cloneBox.CheckedChanged += delegate { tailMode.Enabled = cloneBox.Checked; };
+
             reencode = new CheckBox();
             reencode.Text = "Set video bitrate";
             reencode.ForeColor = Color.FromArgb(200, 200, 210);
             reencode.Font = new Font("Segoe UI", 9.5F);
-            reencode.SetBounds(24, 362, 130, 24);
+            reencode.SetBounds(24, 388, 130, 24);
             reencode.CheckedChanged += delegate { mbps.Enabled = reencode.Checked; };
             Controls.Add(reencode);
 
             mbps = new NumericUpDown();
             mbps.Minimum = 8; mbps.Maximum = 50; mbps.Value = 15;
             mbps.Font = new Font("Segoe UI", 9.5F);
-            mbps.SetBounds(156, 362, 50, 24);
+            mbps.SetBounds(156, 388, 50, 24);
             mbps.Enabled = false;
             Controls.Add(mbps);
 
@@ -1255,11 +1488,11 @@ namespace QualityOptimizer
             mbpsL.Text = "Mbps (default 15; use ~30-40 for 4K)";
             mbpsL.ForeColor = Color.FromArgb(150, 150, 160);
             mbpsL.Font = new Font("Segoe UI", 9F);
-            mbpsL.SetBounds(230, 365, 304, 20);
+            mbpsL.SetBounds(230, 391, 304, 20);
             Controls.Add(mbpsL);
 
             bar = new ProgressBar();
-            bar.SetBounds(24, 394, 500, 12);
+            bar.SetBounds(24, 420, 500, 12);
             bar.Style = ProgressBarStyle.Marquee;
             bar.Visible = false;
             Controls.Add(bar);
@@ -1268,7 +1501,7 @@ namespace QualityOptimizer
             status.Text = "";
             status.ForeColor = Color.FromArgb(160, 200, 160);
             status.Font = new Font("Segoe UI", 9.5F);
-            status.SetBounds(24, 412, 500, 20);
+            status.SetBounds(24, 438, 500, 20);
             Controls.Add(status);
 
             report = new TextBox();
@@ -1279,7 +1512,7 @@ namespace QualityOptimizer
             report.ForeColor = Color.FromArgb(200, 210, 200);
             report.Font = new Font("Consolas", 9F);
             report.BorderStyle = BorderStyle.FixedSingle;
-            report.SetBounds(24, 436, 500, 208);
+            report.SetBounds(24, 462, 500, 208);
             Controls.Add(report);
 
             if (!Tools.Available())
@@ -1330,6 +1563,10 @@ namespace QualityOptimizer
             d.Filter = "MP4 video|*.mp4;*.m4v|All files|*.*";
             if (d.ShowDialog() != DialogResult.OK) return;
             string file = d.FileName;
+            // Use the checks for whichever method is selected (the clone checks
+            // when "New TikTok method" is ticked, else the junk-method checks).
+            bool clone = cloneBox.Checked;
+            bool noGap = tailMode.SelectedIndex != (int)Mp4.TailLayout.V3;
             Busy(true);
             SetStatus("Verifying " + Path.GetFileName(file) + " ...", false);
             SetReport("");
@@ -1338,7 +1575,7 @@ namespace QualityOptimizer
                 try
                 {
                     bool allPass;
-                    string rep = Tools.Report(Tools.Verify(file), out allPass);
+                    string rep = Tools.Report(clone ? Tools.VerifyClone(file, noGap) : Tools.Verify(file), out allPass);
                     ShowVerify(Path.GetFileName(file), rep, allPass);
                 }
                 catch (Exception ex) { Fail(ex.Message); }
@@ -1362,6 +1599,7 @@ namespace QualityOptimizer
             Tools.ReencodeMbps = reencode.Checked ? (int)mbps.Value : 0;
             Tools.CloneMbps = reencode.Checked ? (int)mbps.Value : 15;
             Tools.CloneMaxBox = res4k.Checked ? "2160:3840" : "1080:1920";
+            Tools.CloneTail = (Mp4.TailLayout)tailMode.SelectedIndex;
             bool clone = cloneBox.Checked;
             Busy(true);
             SetStatus("Working...", false);
@@ -1378,9 +1616,9 @@ namespace QualityOptimizer
                     {
                         tmp = Tools.BuildClone(input, audioPath, delegate(string m) { SetStatus(m, false); });
                         File.Copy(tmp, outPath, true);
-                        note = "re-encoded 1080p H.264, cloned audio track";
+                        note = "re-encoded 1080p H.264, cloned audio track, tail: " + Tools.TailName(Tools.CloneTail);
                         SetStatus("Verifying output...", false);
-                        rep = Tools.Report(Tools.VerifyClone(outPath), out allPass);
+                        rep = Tools.Report(Tools.VerifyClone(outPath, Tools.CloneTail != Mp4.TailLayout.V3), out allPass);
                         Done(outPath, note, rep, allPass);
                         return;
                     }
@@ -1458,6 +1696,7 @@ namespace QualityOptimizer
             mbps.Enabled = !on && reencode.Checked;
             cloneBox.Enabled = !on;
             res4k.Enabled = !on;
+            tailMode.Enabled = !on && cloneBox.Checked;
         }
 
         void SetReport(string text)
@@ -1522,12 +1761,27 @@ namespace QualityOptimizer
                 string[] rest = new string[args.Length - 1]; Array.Copy(args, 1, rest, 0, rest.Length); args = rest;
             }
 
+            // Optional tail layout for the clone engine:  -tail v3|keep|front
+            // (default v3, the upload-confirmed one; keep/front remove the ~0.4 s
+            // silent end and are NOT upload-tested). With -verify, keep/front
+            // make the end-gap line a real check.
+            if (args.Length >= 2 && (args[0] == "-tail" || args[0] == "/tail"))
+            {
+                string tm = args[1].ToLowerInvariant();
+                if (tm == "v3") Tools.CloneTail = Mp4.TailLayout.V3;
+                else if (tm == "keep") Tools.CloneTail = Mp4.TailLayout.KeepEditLists;
+                else if (tm == "front") Tools.CloneTail = Mp4.TailLayout.Front;
+                else { Console.Error.WriteLine("usage: optimizer.exe -clone [-4k|-native] -tail v3|keep|front ..."); Environment.Exit(2); }
+                string[] rest = new string[args.Length - 2]; Array.Copy(args, 2, rest, 0, rest.Length); args = rest;
+            }
+            bool noGap = Tools.CloneTail != Mp4.TailLayout.V3;
+
             // Verify only:  Optimizer.exe -verify <file>
             if (args.Length >= 1 && (args[0] == "-verify" || args[0] == "/verify"))
             {
                 if (args.Length < 2) { Console.Error.WriteLine("usage: optimizer.exe -verify <file>"); Environment.Exit(2); }
                 bool allPass;
-                Console.WriteLine(Tools.Report(clone ? Tools.VerifyClone(args[1]) : Tools.Verify(args[1]), out allPass));
+                Console.WriteLine(Tools.Report(clone ? Tools.VerifyClone(args[1], noGap) : Tools.Verify(args[1]), out allPass));
                 Console.WriteLine(allPass ? "VERDICT: all checks passed." : "VERDICT: some checks did not pass.");
                 Environment.Exit(allPass ? 0 : 1);
             }
@@ -1544,7 +1798,7 @@ namespace QualityOptimizer
                         string tmpc = Tools.BuildClone(args[1], args[2], delegate(string m) { Console.WriteLine(m); });
                         File.Copy(tmpc, args[3], true);
                         if (File.Exists(tmpc)) File.Delete(tmpc);
-                        note = "re-encoded 1080p H.264, cloned audio track";
+                        note = "re-encoded 1080p H.264, cloned audio track, tail: " + Tools.TailName(Tools.CloneTail);
                     }
                     else
                     {
@@ -1556,7 +1810,7 @@ namespace QualityOptimizer
                     }
                     Console.WriteLine("OK: " + args[3] + "  (" + note + ")");
                     bool allPass;
-                    Console.WriteLine(Tools.Report(clone ? Tools.VerifyClone(args[3]) : Tools.Verify(args[3]), out allPass));
+                    Console.WriteLine(Tools.Report(clone ? Tools.VerifyClone(args[3], noGap) : Tools.Verify(args[3]), out allPass));
                     Console.WriteLine(allPass ? "VERDICT: all checks passed." : "VERDICT: some checks did not pass.");
                     Environment.Exit(allPass ? 0 : 1);
                 }
@@ -1578,7 +1832,7 @@ namespace QualityOptimizer
                         string tmpc = Tools.BuildClone(args[0], null, delegate(string m) { Console.WriteLine(m); });
                         File.Copy(tmpc, args[1], true);
                         if (File.Exists(tmpc)) File.Delete(tmpc);
-                        note = "re-encoded 1080p H.264, cloned audio track";
+                        note = "re-encoded 1080p H.264, cloned audio track, tail: " + Tools.TailName(Tools.CloneTail);
                     }
                     else
                     {
@@ -1590,7 +1844,7 @@ namespace QualityOptimizer
                     }
                     Console.WriteLine("OK: " + args[1] + "  (" + note + ")");
                     bool allPass;
-                    Console.WriteLine(Tools.Report(clone ? Tools.VerifyClone(args[1]) : Tools.Verify(args[1]), out allPass));
+                    Console.WriteLine(Tools.Report(clone ? Tools.VerifyClone(args[1], noGap) : Tools.Verify(args[1]), out allPass));
                     Console.WriteLine(allPass ? "VERDICT: all checks passed." : "VERDICT: some checks did not pass.");
                     Environment.Exit(allPass ? 0 : 1);
                 }

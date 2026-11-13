@@ -64,6 +64,10 @@ there is no quality loss from this tool.
    since ~2026-11 where the junk method stopped working. See "New clone engine"
    below. When checked, it governs both buttons and ignores the legacy re-encode
    box.
+8. **End-gap fix** (clone engine only; default **Off - v3**) picks where the
+   clone engine puts its 16 silent tail frames. v3 leaves ~0.4 s of silence with
+   no picture at the end of every file; the other two layouts remove it but are
+   **not upload-tested**. See "End gap (2026-11-13)" below.
 
 **Requirements.** `ffmpeg.exe` and `ffprobe.exe` must be on `PATH` (already
 installed on this machine via WinGet) **or** sitting next to `optimizer.exe`.
@@ -80,7 +84,13 @@ checks pass:
   the junk method (see "New clone engine" below): re-encode to 1080p H.264 +
   duplicate audio track. `optimizer.exe -clone in.mov out.mp4`,
   `optimizer.exe -clone -mux video.mp4 song.mp3 out.mp4`,
-  `optimizer.exe -clone -verify out.mp4`. Note: the exe is a GUI-subsystem
+  `optimizer.exe -clone -verify out.mp4`.
+- With `-clone`, add `-tail v3|keep|front` to pick the tail layout (default
+  `v3`; see "End gap (2026-11-13)"). Flag order: `-bitrate N`, `-clone`,
+  `-4k`/`-native`, `-tail X`, then the command, e.g.
+  `optimizer.exe -clone -tail keep -mux video.mp4 song.mp3 out.mp4`. With
+  `-verify`, `-tail keep|front` turns the end-gap line into a real check.
+  Note: the exe is a GUI-subsystem
   binary, so its console output is not visible when launched from PowerShell;
   rely on the exit code (0 = all checks passed) or the GUI.
 
@@ -280,7 +290,10 @@ with valid frames instead of junk.
 
 `VerifyClone` checks 1 video + 2 audio, both audio tracks decode with 0 errors
 (valid, not junk), equal packet counts, video decodes clean and is ≤1080p H.264,
-and the container parses.
+and the container parses. It also reports the **end gap** (file duration minus
+video duration): `[INFO]` for v3, a real PASS/WARN (≤ 0.100 s) for the no-gap
+layouts. "Verify a File…" in the GUI now uses these clone checks when "New
+TikTok method" is ticked (it used to always run the junk-method checks).
 
 The current engine reproduces the **two-sample-description quirk**: the real
 audio track carries a 2nd `esds` (an mp4a sample entry lifted verbatim from a
@@ -317,6 +330,69 @@ proves it is not needed.
 The clone engine re-encodes (one generation of loss) and caps at 1080p — the
 price of the new method; a 1080p upload served raw still beats a 4K upload
 crushed to 540p.
+
+Correction (2026-11-13): v1 also lacked the mismatch, so v1 failing does not
+show that the shared-bytes clone and the tail are needed. What v1→v2→v3 proves
+is only that the full v3 works and that adding the mismatch to v2 made it work.
+
+## End gap (2026-11-13)
+
+**Symptom (user report):** clone-engine posts end with a short black (or frozen)
+screen and silence before the loop, on TikTok and in local players. Posts made
+with the old junk method loop seamlessly.
+
+**Cause (VERIFIED by rebuilding the engine on Linux and measuring).** v3 appends
+16 silent AAC frames after the song. An AAC frame always decodes to 1024
+samples, so that is 16 × 1024 / 44,100 = 0.372 s of real audio output. v3 also
+(a) deletes the audio edit lists, so the 1024-sample encoder delay is played
+(audio ~23 ms late) instead of skipped, and (b) stretches tkhd/mvhd over the
+tail. The video track is untouched, so the file runs past the last video frame.
+Neither (a) nor (b) was copied from RTXFury (the code comment said "we
+assume"); the October RTXFury file kept the edit list on its real audio track.
+
+| File (6.000 s, 1080×1920 60 fps test clip) | File ends | Gap after last frame |
+|---|---|---|
+| Plain re-encode, no surgery | 6.016 s | ~0 |
+| v3 | 6.411 s | 0.411 s |
+| v3 + Add Song | 6.385 s | 0.385 s |
+| v3, source audio 0.5 s longer than its video | 6.901 s | 0.901 s |
+
+In Chromium, playing the last second of video to the `ended` event takes
+0.43 s longer for v3 than for the plain file; Chromium holds the last frame,
+other players show black. Shortening the tail's timestamps (1 tick per frame)
+does **not** help: decoders still output 1024 samples per frame and Chromium
+plays them.
+
+**The two no-gap layouts** (`Mp4.TailLayout`, GUI "End-gap fix", `-tail`):
+
+- **Keep edit lists** (`keep`) = v3 minus (a) and (b). Same tail, same
+  two-description mismatch; mdhd still covers the tail. Playback stops at the
+  end of the song. Trade-off: ffmpeg's demuxer then drops the tail frames that
+  carry description 2 (262 of 277 packets read), so a reader that works like
+  ffmpeg never reaches the config switch. If TikTok's trigger needs that switch
+  to be read, this layout gets re-encoded.
+- **Silent frames at start** (`front`): the tail sits before the song, inside
+  the edit list's skipped start (media_time = 16 × 1024 + encoder delay). ffmpeg
+  still demuxes and decodes all 277 packets (marked discard), the real track
+  still switches to description 2 and back while the clone track does not, and
+  nothing plays after the song. Differs from v3 in tail position, so it is the
+  bigger structural change.
+
+Both no-gap layouts also fix the 23 ms audio lag. Measured on the test clip
+(C# build, run under Mono): v3 output is byte-identical to the previous build
+on three inputs; `keep` and `front` pass all clone checks with an end gap of
+0.016 s (0.000 s with Add Song or a no-audio source), Chromium end delay within
+0.03 s of the plain file, and 0 decode errors on both audio tracks.
+
+**Status: NOT upload-tested.** Test plan: post the same edit made with `keep`
+(first, smallest change) and, if that is re-encoded, with `front`. Pass = served
+size equals the uploaded size and `bitrateInfo` is empty. Keep v3 as the
+default until one passes.
+
+**Sound ID (inconclusive).** Raw-served junk-method posts: 10-26 (p91) got an
+identified sound, 10-29 (p93) did not. Same structure, different outcome, so
+sound identification does not show anything about the file; it is probably
+down to the song itself (or timing).
 
 ---
 

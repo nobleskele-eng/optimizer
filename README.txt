@@ -27,6 +27,20 @@ only helps if the source is low-bitrate or HEVC and you want an H.264 file.
 Leave it off to keep your video exactly as it is.
 Command line:  optimizer.exe -bitrate 25 "in.mov" "out.mp4"
 
+End-gap fix (experimental, New TikTok method only)
+-------------------------------------------------
+The New TikTok method (v3) leaves about 0.4 s of silence with no picture at
+the end of every file, which shows up as a pause before the video loops. The
+"End-gap fix" dropdown picks how the tool builds that part of the file:
+  - Off - v3                  the method confirmed by upload (has the pause)
+  - Keep edit lists           no pause; NOT upload-tested yet
+  - Silent frames at start    no pause; NOT upload-tested yet
+Test a no-pause option on one post before relying on it: it only counts if
+TikTok serves the file at original quality. The report shows an "End gap" line
+(how long the file runs after the last video frame).
+Command line:  optimizer.exe -clone -tail keep "in.mov" "out.mp4"
+               (-tail v3, keep or front)
+
 Add your own song / audio
 -------------------------
 To put a specific track on your clip, click "Add Song + Optimize...", pick the
