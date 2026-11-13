@@ -15,10 +15,13 @@ research notes below (sections 1–10) are the specification it is built from.
 > **Current method (2026-11-09): use the clone engine.** TikTok stopped honoring
 > the original junk-track method around 2026-11-08. The **clone engine**
 > (`-clone` flag / the GUI "New TikTok method" checkbox, now on by default) is
-> **confirmed working** by upload — it re-encodes to 1080p H.264 and reproduces
-> RTXFury v2's two-audio-track + two-sample-description structure. See
-> "New clone engine" below. The junk-track method described first is kept for
-> reference but no longer works on TikTok.
+> **confirmed working** by upload — it re-encodes to H.264 (1080p by default)
+> and reproduces RTXFury v2's two-audio-track + two-sample-description
+> structure. **4K is confirmed too (2026-11-11):** with "Allow up to 4K" /
+> `-4k`, two 2160×3840 uploads at 60 and 59.94 fps were served raw at full
+> resolution and their original frame rate. See "New clone engine" below. The
+> junk-track method described first is kept for reference but no longer works
+> on TikTok.
 
 **What it does.** Takes an input video and writes a new MP4 that carries the
 container signature studied below — a third audio track whose tail is
@@ -63,7 +66,10 @@ there is no quality loss from this tool.
    switches to the clone engine instead of the junk method, for TikTok uploads
    since ~2026-11 where the junk method stopped working. See "New clone engine"
    below. When checked, it governs both buttons and ignores the legacy re-encode
-   box.
+   box. **Allow up to 4K** under it raises the clone engine's cap from
+   1080×1920 to 2160×3840 (upload-confirmed 2026-11-11). Pair it with
+   **Set video bitrate** at a high rate: the confirmed 4K uploads came out at
+   44–48 Mbps.
 8. **End-gap fix** (clone engine only; default **Off - v3**) picks where the
    clone engine puts its 16 silent tail frames. v3 leaves ~0.4 s of silence with
    no picture at the end of every file; the other two layouts remove it but are
@@ -81,15 +87,18 @@ checks pass:
 - Prefix either convert form with `-bitrate <Mbps>` to re-encode the video at
   that rate, e.g. `optimizer.exe -bitrate 25 in.mov out.mp4`.
 - Prefix any convert form with `-clone` to use the **clone engine** instead of
-  the junk method (see "New clone engine" below): re-encode to 1080p H.264 +
-  duplicate audio track. `optimizer.exe -clone in.mov out.mp4`,
+  the junk method (see "New clone engine" below): re-encode to H.264 (1080p by
+  default) + duplicate audio track. `optimizer.exe -clone in.mov out.mp4`,
   `optimizer.exe -clone -mux video.mp4 song.mp3 out.mp4`,
-  `optimizer.exe -clone -verify out.mp4`.
+  `optimizer.exe -clone -verify out.mp4`. After `-clone`, add `-4k` to cap
+  at 2160×3840 instead of 1080×1920 (upload-confirmed), or `-native` to keep
+  the source resolution (not tested by upload above 4K).
 - With `-clone`, add `-tail v3|keep|front` to pick the tail layout (default
-  `v3`; see "End gap (2026-11-13)"). Flag order: `-bitrate N`, `-clone`,
-  `-4k`/`-native`, `-tail X`, then the command, e.g.
-  `optimizer.exe -clone -tail keep -mux video.mp4 song.mp3 out.mp4`. With
-  `-verify`, `-tail keep|front` turns the end-gap line into a real check.
+  `v3`; see "End gap (2026-11-13)"). With `-verify`, `-tail keep|front` turns
+  the end-gap line into a real check.
+- Flag order: `-bitrate N`, `-clone`, `-4k`/`-native`, `-tail X`, then the
+  command, e.g. `optimizer.exe -bitrate 45 -clone -4k in.mov out.mp4` or
+  `optimizer.exe -clone -tail keep -mux video.mp4 song.mp3 out.mp4`.
   Note: the exe is a GUI-subsystem
   binary, so its console output is not visible when launched from PowerShell;
   rely on the exit code (0 = all checks passed) or the GUI.
@@ -276,7 +285,8 @@ with valid frames instead of junk.
 **The `-clone` engine** (`Tools.BuildClone` in `src/Optimizer.cs`, GUI checkbox
 "New TikTok method") works in two stages:
 1. ffmpeg builds a clean single-audio base — re-encode video to H.264 **Main,
-   `-bf 0`** (tries `h264_nvenc`, falls back to libx264), downscale to ≤1080p,
+   `-bf 0`** (tries `h264_nvenc`, falls back to libx264), downscale to fit
+   1080×1920 (default), 2160×3840 (`-4k`) or not at all (`-native`),
    re-encode audio to AAC-LC, `-map_metadata -1` to drop the source `vid:` ID,
    moov written last.
 2. `Mp4.BuildCloneContainer` does byte surgery (moov is last, so the main mdat
@@ -289,11 +299,11 @@ with valid frames instead of junk.
    tail), which is itself a well-formed version of the old junk-track idea.
 
 `VerifyClone` checks 1 video + 2 audio, both audio tracks decode with 0 errors
-(valid, not junk), equal packet counts, video decodes clean and is ≤1080p H.264,
-and the container parses. It also reports the **end gap** (file duration minus
-video duration): `[INFO]` for v3, a real PASS/WARN (≤ 0.100 s) for the no-gap
-layouts. "Verify a File…" in the GUI now uses these clone checks when "New
-TikTok method" is ticked (it used to always run the junk-method checks).
+(valid, not junk), equal packet counts, video decodes clean and is H.264 within
+2160×3840, and the container parses. It also reports the **end gap** (file
+duration minus video duration): `[INFO]` for v3, a real PASS/WARN (≤ 0.100 s)
+for the no-gap layouts. "Verify a File…" in the GUI now uses these clone checks
+when "New TikTok method" is ticked (it used to always run the junk-method checks).
 
 The current engine reproduces the **two-sample-description quirk**: the real
 audio track carries a 2nd `esds` (an mp4a sample entry lifted verbatim from a
@@ -327,9 +337,31 @@ that mismatch. The shared-bytes clone and second-mdat tail are necessary scaffol
 The stale-moov `free` stub is the only RTXFury feature still not copied, and v3
 proves it is not needed.
 
-The clone engine re-encodes (one generation of loss) and caps at 1080p — the
-price of the new method; a 1080p upload served raw still beats a 4K upload
-crushed to 540p.
+**4K confirmed by upload (2026-11-11).** Two clone-engine outputs made with
+"Allow up to 4K" were posted on the same account about 2.5 minutes apart. Both
+were served raw:
+
+| | p98 ferry sunset sea gulls | p99 umbrella walk rainy bridge |
+|---|---|---|
+| Source | HEVC 2160×3840, 60 fps, 17.3 Mbps | HEVC 2160×3840, 59.94 fps (2997/50), 3.3 Mbps |
+| Upload | H.264 Main L5.2, NVENC, no B-frames, 2160×3840, 60 fps, 44.5 Mbps, 52,484,251 B | same, 59.94 fps, 48.2 Mbps, 49,808,465 B |
+| `encodedType` / `videoQuality` | original / original | original / original |
+| `definition` | 2160p | 2160p |
+| `bitrateInfo` | empty | empty |
+| Served file | 52,484,251 B, SHA-256 identical to the upload, 60 fps, 563 frames | 49,808,465 B, SHA-256 identical to the upload, 59.94 fps, 493 frames |
+
+So the two-sample-description trigger does not depend on resolution, frame
+rate (60 and 59.94 both come back unchanged, not resampled) or a bitrate of up
+to about 48 Mbps. Caveat: the page data was read about 2 minutes (p99) and 4
+minutes (p98) after posting. That is past the 92 s point at which an earlier
+failed build already had its re-encode. A later re-check was blocked by
+TikTok's bot-check page, so it is not yet checked whether these posts stay raw
+over hours. The junk-method posts from 10-26 and 10-29 were still raw 10+ days
+later.
+
+The clone engine re-encodes (one generation of loss), so set a high bitrate.
+It caps at 1080p by default; for a 4K source, turn on "Allow up to 4K" (`-4k`),
+which is now upload-confirmed.
 
 Correction (2026-11-13): v1 also lacked the mismatch, so v1 failing does not
 show that the shared-bytes clone and the tail are needed. What v1→v2→v3 proves
