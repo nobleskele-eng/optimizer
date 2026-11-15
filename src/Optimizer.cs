@@ -804,6 +804,158 @@ namespace QualityOptimizer
             moov.Write(ms);
             return ms.ToArray();
         }
+
+        // ---- Passthrough junk audio tail (RTXFury "newest", 2026-11-15) -----
+        // The newest real RTXFury output (rtx-optimized-dd39.mp4) is NOT the
+        // fully clean remux the earlier ca17 sample looked like. It is a clean
+        // faststart file (video stream-copied, 1 video + 1 audio) whose LAST
+        // FOUR audio frames are overwritten with a fixed 15-byte undecodable
+        // constant and relocated into a trailing mdat placed after the main one.
+        // The audio sample COUNT and timeline are preserved (no added duration,
+        // so no end gap), and the file still parses as a clean 1v+1a file, but a
+        // server-side AAC decode reaches the junk tail and errors. This recreates
+        // that: keep the clean remux, corrupt the last K audio frames into a
+        // trailing mdat. moov stays at the front; because rewriting the audio
+        // chunk table changes moov's size, every chunk offset is re-derived.
+        static readonly byte[] JUNK_AAC = new byte[] {
+            0xa0, 0x98, 0x00, 0x40, 0x01, 0x28, 0x00, 0x64, 0x00, 0x00, 0x03, 0x50, 0x00, 0x00, 0x38 };
+        const int JUNK_TAIL_FRAMES = 4;
+
+        public static byte[] AddJunkAudioTail(byte[] data, out string note)
+        {
+            note = "";
+            List<Top> top = TopLevel(data);
+            int ftypI = -1, moovI = -1, mdatI = -1;
+            for (int i = 0; i < top.Count; i++)
+            {
+                if (top[i].Type == "ftyp" && ftypI < 0) ftypI = i;
+                else if (top[i].Type == "moov" && moovI < 0) moovI = i;
+                else if (top[i].Type == "mdat" && mdatI < 0) mdatI = i;
+            }
+            if (ftypI < 0 || moovI < 0 || mdatI < 0)
+                throw new Exception("Passthrough file is missing ftyp/moov/mdat.");
+            Top ftypT = top[ftypI], mdatT = top[mdatI];
+            int mq = top[moovI].Start;
+            Box moov = Box.ParseBox(data, ref mq);
+
+            Box audio = null;
+            foreach (Box k in moov.Kids)
+                if (k.Type == "trak" && HandlerType(k) == "soun") { audio = k; break; }
+            if (audio == null) throw new Exception("No audio track in passthrough file.");
+
+            Box stbl = audio.Kid("mdia").Kid("minf").Kid("stbl");
+            Box stszB = stbl.Kid("stsz");
+            Box stscB = stbl.Kid("stsc");
+            Box stcoB = stbl.Kid("stco");
+            Box co64B = stbl.Kid("co64");
+            if (stszB == null || stscB == null || (stcoB == null && co64B == null))
+                throw new Exception("Audio sample tables incomplete.");
+            bool is64 = (co64B != null);
+            Box chunkB = is64 ? co64B : stcoB;
+
+            // Sample sizes.
+            byte[] zp = stszB.Payload;
+            uint uniform = BE.RU32(zp, 4);
+            int N = (int)BE.RU32(zp, 8);
+            if (N < 2) throw new Exception("Audio track too short for a junk tail.");
+            uint[] sizes = new uint[N];
+            if (uniform != 0) { for (int i = 0; i < N; i++) sizes[i] = uniform; }
+            else { for (int i = 0; i < N; i++) sizes[i] = BE.RU32(zp, 12 + i * 4); }
+
+            // Chunk offsets.
+            byte[] cp = chunkB.Payload;
+            int nChunks = (int)BE.RU32(cp, 4);
+            long[] chunkOff = new long[nChunks];
+            for (int c = 0; c < nChunks; c++)
+                chunkOff[c] = is64 ? (long)BE.RU64(cp, 8 + c * 8) : BE.RU32(cp, 8 + c * 4);
+
+            // Samples-per-chunk (expand stsc runs).
+            byte[] sp = stscB.Payload;
+            int stscN = (int)BE.RU32(sp, 4);
+            int[] spc = new int[nChunks];
+            uint descIndex = 1;
+            for (int e = 0; e < stscN; e++)
+            {
+                int firstChunk = (int)BE.RU32(sp, 8 + e * 12);              // 1-based
+                int perChunk = (int)BE.RU32(sp, 8 + e * 12 + 4);
+                if (e == 0) descIndex = BE.RU32(sp, 8 + e * 12 + 8);
+                int lastChunk = (e + 1 < stscN) ? (int)BE.RU32(sp, 8 + (e + 1) * 12) - 1 : nChunks;
+                for (int c = firstChunk; c <= lastChunk && c <= nChunks; c++) spc[c - 1] = perChunk;
+            }
+
+            // Flatten to per-sample byte offsets.
+            long[] sampleOff = new long[N];
+            int s = 0;
+            for (int c = 0; c < nChunks && s < N; c++)
+            {
+                long o = chunkOff[c];
+                for (int j = 0; j < spc[c] && s < N; j++) { sampleOff[s] = o; o += sizes[s]; s++; }
+            }
+            if (s != N) throw new Exception("Audio sample-table flatten mismatch (" + s + " != " + N + ").");
+
+            int K = Math.Min(JUNK_TAIL_FRAMES, N - 1);   // keep at least one real frame
+
+            // stsz: last K entries -> 15 bytes (always written non-uniform).
+            for (int i = N - K; i < N; i++) sizes[i] = (uint)JUNK_AAC.Length;
+            byte[] nz = new byte[12 + N * 4];
+            BE.WU32(nz, 0, 0); BE.WU32(nz, 4, 0); BE.WU32(nz, 8, (uint)N);
+            for (int i = 0; i < N; i++) BE.WU32(nz, 12 + i * 4, sizes[i]);
+            stszB.Payload = nz;
+
+            // stco/co64: one chunk per sample, original (pre-shift) offsets.
+            int entW = is64 ? 8 : 4;
+            byte[] nco = new byte[8 + N * entW];
+            BE.WU32(nco, 0, 0); BE.WU32(nco, 4, (uint)N);
+            for (int i = 0; i < N; i++)
+            {
+                if (is64) BE.WU64(nco, 8 + i * 8, (ulong)sampleOff[i]);
+                else BE.WU32(nco, 8 + i * 4, (uint)sampleOff[i]);
+            }
+            chunkB.Payload = nco;
+
+            // stsc: single run, 1 sample per chunk, original description index.
+            byte[] ns = new byte[8 + 12];
+            BE.WU32(ns, 0, 0); BE.WU32(ns, 4, 1);
+            BE.WU32(ns, 8, 1); BE.WU32(ns, 12, 1); BE.WU32(ns, 16, descIndex);
+            stscB.Payload = ns;
+
+            // stts, edit list, sample groups unchanged: count/timeline preserved.
+
+            // Layout: ftyp, moov, mdat, trailing junk mdat. Rewriting the chunk
+            // table resized moov, so re-derive every chunk offset.
+            long newMoovSize = moov.ComputeSize();
+            long newMdatStart = ftypT.Size + newMoovSize;
+            long delta = newMdatStart - mdatT.Start;
+            ShiftChunkOffsets(moov, delta);
+
+            long trailBytes = (long)K * JUNK_AAC.Length;
+            long trailPayloadStart = newMdatStart + mdatT.Size + 8;
+            byte[] ncp = chunkB.Payload;  // same array, now shifted
+            for (int i = 0; i < K; i++)
+            {
+                long off = trailPayloadStart + (long)i * JUNK_AAC.Length;
+                int idx = N - K + i;
+                if (is64) BE.WU64(ncp, 8 + idx * 8, (ulong)off);
+                else
+                {
+                    if (off > uint.MaxValue) throw new Exception("File too large for 32-bit offsets.");
+                    BE.WU32(ncp, 8 + idx * 4, (uint)off);
+                }
+            }
+
+            MemoryStream ms = new MemoryStream((int)(newMdatStart + mdatT.Size + 8 + trailBytes));
+            ms.Write(data, ftypT.Start, (int)ftypT.Size);
+            moov.Write(ms);
+            ms.Write(data, mdatT.Start, (int)mdatT.Size);
+            byte[] th = new byte[8];
+            BE.WU32(th, 0, (uint)(8 + trailBytes));
+            th[4] = (byte)'m'; th[5] = (byte)'d'; th[6] = (byte)'a'; th[7] = (byte)'t';
+            ms.Write(th, 0, 8);
+            for (int i = 0; i < K; i++) ms.Write(JUNK_AAC, 0, JUNK_AAC.Length);
+
+            note = String.Format("audio {0} frames, last {1} -> 15-byte junk in a trailing mdat", N, K);
+            return ms.ToArray();
+        }
     }
 
     // ---- A single verification check ---------------------------------------
@@ -1049,6 +1201,101 @@ namespace QualityOptimizer
             {
                 if (File.Exists(tmp)) File.Delete(tmp);
                 throw new Exception("ffmpeg could not attach that audio file.\n\n" + Tail(se, 1500));
+            }
+            return tmp;
+        }
+
+        // ---- "Passthrough" engine (RTXFury's NEW method, 2026-11) ----------
+        // A clean faststart remux, NOT the clone surgery. The video is
+        // stream-copied when it is already H.264 or HEVC (zero re-encode, zero
+        // loss); the audio is copied when it is already AAC-LC and otherwise
+        // re-encoded to AAC-LC (so HE-AAC sources work here, where RTXFury's own
+        // tool now rejects them). Brand isom, moov moved to the front, one audio
+        // track, one mdat, no header tricks. Mirrors the reverse-engineered
+        // rtx-optimized-*.mp4 output (ftyp, moov, free, mdat; Lavf mux).
+        public static bool PassthroughForceH264 = false; // true: re-encode HEVC -> H.264
+
+        public static string BuildPassthrough(string videoIn, string audioIn, Action<string> status)
+        {
+            string ffmpeg = Find("ffmpeg");
+            string ffprobe = Find("ffprobe");
+            string tmp = Path.Combine(Path.GetTempPath(), "qopt_" + Guid.NewGuid().ToString("N") + ".mp4");
+            string so, se;
+
+            // Decide whether the video can be stream-copied (no quality loss).
+            Run(ffprobe, "-v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 \"" + videoIn + "\"", out so, out se);
+            string vcodec = so.Trim().ToLowerInvariant();
+            bool vCopyable = (vcodec == "h264" || vcodec == "hevc" || vcodec == "h265");
+            bool reencodeV = !vCopyable || (PassthroughForceH264 && vcodec != "h264");
+            string vArgs = reencodeV
+                ? "-c:v libx264 -preset medium -profile:v high -pix_fmt yuv420p -crf 18"
+                : "-c:v copy";
+
+            string inputs, maps, aArgs;
+            if (audioIn != null)
+            {
+                inputs = "-i \"" + videoIn + "\" -i \"" + audioIn + "\"";
+                maps = "-map 0:v:0 -map 1:a:0 -af apad -shortest";
+                aArgs = "-c:a aac -b:a 192k"; // external track -> AAC-LC
+            }
+            else if (HasAudio(ffprobe, videoIn))
+            {
+                Run(ffprobe, "-v error -select_streams a:0 -show_entries stream=codec_name,profile -of csv=p=0 \"" + videoIn + "\"", out so, out se);
+                string[] ap = so.Trim().Split(',');
+                string acodec = ap.Length > 0 ? ap[0].Trim().ToLowerInvariant() : "";
+                string aprof = ap.Length > 1 ? ap[1].Trim().ToUpperInvariant() : "";
+                bool aLC = (acodec == "aac" && aprof.IndexOf("LC") >= 0 && aprof.IndexOf("HE") < 0);
+                inputs = "-i \"" + videoIn + "\"";
+                maps = "-map 0:v:0 -map 0:a:0";
+                aArgs = aLC ? "-c:a copy" : "-c:a aac -b:a 192k";
+            }
+            else
+            {
+                inputs = "-i \"" + videoIn + "\" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000";
+                maps = "-map 0:v:0 -map 1:a:0 -shortest";
+                aArgs = "-c:a aac -b:a 128k";
+            }
+
+            status(reencodeV
+                ? "Clean passthrough (re-encoding video to H.264)..."
+                : "Clean passthrough (copying streams, no re-encode)...");
+            string args = "-nostdin -y " + inputs + " " + maps + " " + vArgs + " " + aArgs +
+                          " -movflags +faststart -map_metadata 0 \"" + tmp + "\"";
+            int rc = Run(ffmpeg, args, out so, out se);
+
+            // Fallback: if a stream-copy failed, re-encode both streams.
+            if (rc != 0 || !File.Exists(tmp) || new FileInfo(tmp).Length == 0)
+            {
+                if (File.Exists(tmp)) { try { File.Delete(tmp); } catch { } }
+                status("Source needs a compatible encode; converting...");
+                string fbInputs, fbMaps;
+                if (audioIn != null) { fbInputs = "-i \"" + videoIn + "\" -i \"" + audioIn + "\""; fbMaps = "-map 0:v:0 -map 1:a:0 -af apad -shortest"; }
+                else if (HasAudio(ffprobe, videoIn)) { fbInputs = "-i \"" + videoIn + "\""; fbMaps = "-map 0:v:0 -map 0:a:0"; }
+                else { fbInputs = "-i \"" + videoIn + "\" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000"; fbMaps = "-map 0:v:0 -map 1:a:0 -shortest"; }
+                string fbArgs = "-nostdin -y " + fbInputs + " " + fbMaps +
+                                " -c:v libx264 -preset medium -profile:v high -pix_fmt yuv420p -crf 18 -c:a aac -b:a 192k" +
+                                " -movflags +faststart -map_metadata 0 \"" + tmp + "\"";
+                rc = Run(ffmpeg, fbArgs, out so, out se);
+                if (rc != 0 || !File.Exists(tmp))
+                {
+                    if (File.Exists(tmp)) { try { File.Delete(tmp); } catch { } }
+                    throw new Exception("ffmpeg could not build the passthrough file.\n\n" + Tail(se, 1500));
+                }
+            }
+
+            // RTXFury's newest output (dd39) is this clean remux PLUS a junk
+            // audio tail in a trailing mdat; reproduce it. Fail open to the clean
+            // file if the byte surgery errors, so a post always has a valid file.
+            try
+            {
+                string tnote;
+                byte[] withTail = Mp4.AddJunkAudioTail(File.ReadAllBytes(tmp), out tnote);
+                File.WriteAllBytes(tmp, withTail);
+                status("Clean passthrough + junk audio tail (" + tnote + ").");
+            }
+            catch (Exception ex)
+            {
+                status("Passthrough: junk-tail surgery skipped, clean file kept (" + ex.Message + ").");
             }
             return tmp;
         }
@@ -1328,6 +1575,82 @@ namespace QualityOptimizer
             return r;
         }
 
+        // Checks for a "passthrough" output (RTXFury's 2026-11 method): a clean
+        // faststart remux, NOT the clone. 1 video + 1 audio, video intact
+        // (H.264/HEVC), audio AAC-LC, moov before mdat, brand isom, single mdat,
+        // no trailing junk.
+        public static List<VCheck> VerifyPassthrough(string file)
+        {
+            string ffprobe = Find("ffprobe");
+            string ffmpeg = Find("ffmpeg");
+            List<VCheck> r = new List<VCheck>();
+            string so, se;
+            string q = "\"" + file + "\"";
+
+            // 1. 1 video + 1 audio (no clone track)
+            Run(ffprobe, "-v error -show_entries stream=codec_type -of csv=p=0 " + q, out so, out se);
+            int nv = 0, na = 0;
+            foreach (string ln in SplitLines(so)) { if (ln.Contains("video")) nv++; else if (ln.Contains("audio")) na++; }
+            r.Add(new VCheck("Stream layout", nv == 1 && na == 1, nv + " video, " + na + " audio (want 1 video + 1 audio)"));
+
+            // 2. video is H.264/HEVC and decodes clean (copy intact, no corruption)
+            Run(ffprobe, "-v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 " + q, out so, out se);
+            string vcodec = so.Trim().ToLowerInvariant();
+            Run(ffmpeg, "-nostdin -v error -i " + q + " -map 0:v:0 -f null -", out so, out se);
+            int ve = CountLines(se);
+            bool vok = (vcodec == "h264" || vcodec == "hevc") && ve == 0;
+            r.Add(new VCheck("Video intact (copied/clean)", vok, "codec " + (vcodec.Length == 0 ? "?" : vcodec) + ", " + ve + " decode errors"));
+
+            // 3. audio is AAC-LC (codec/profile; the tail frames are junk by design)
+            Run(ffprobe, "-v error -select_streams a:0 -show_entries stream=codec_name,profile -of csv=p=0 " + q, out so, out se);
+            string[] apx = so.Trim().Split(',');
+            string ac = apx.Length > 0 ? apx[0].Trim().ToLowerInvariant() : "";
+            string apr = apx.Length > 1 ? apx[1].Trim().ToUpperInvariant() : "";
+            Run(ffmpeg, "-nostdin -v error -i " + q + " -map 0:a:0 -f null -", out so, out se);
+            int ae = CountLines(se);
+            bool aok = ac == "aac" && apr.IndexOf("LC") >= 0 && apr.IndexOf("HE") < 0;
+            r.Add(new VCheck("Audio is AAC-LC", aok, "codec " + (ac.Length == 0 ? "?" : ac) + " " + apr));
+
+            // 4. junk audio tail breaks decoders (the RTXFury dd39 trigger)
+            r.Add(new VCheck("Audio junk tail (breaks decoders)", ae > 0, ae + " decode errors on the tail (want > 0)"));
+
+            // 5/6. faststart (moov before first mdat), and a trailing junk mdat
+            bool faststart = false, tailMdat = false, parsed = true; string order = "";
+            try
+            {
+                using (FileStream fs = File.OpenRead(file))
+                {
+                    List<string> types = new List<string>();
+                    long o = 0, len = fs.Length; byte[] hh = new byte[16]; bool bad = false;
+                    while (o + 8 <= len)
+                    {
+                        fs.Seek(o, SeekOrigin.Begin); fs.Read(hh, 0, 16);
+                        long size = BE.RU32(hh, 0);
+                        if (size == 1) size = (long)BE.RU64(hh, 8);
+                        else if (size == 0) size = len - o;
+                        if (size < 8 || o + size > len) { bad = true; break; }
+                        types.Add(BE.Ascii(hh, 4, 4)); o += size;
+                    }
+                    if (bad) parsed = false;
+                    order = String.Join(", ", types.ToArray());
+                    int im = types.IndexOf("moov"), id = types.IndexOf("mdat");
+                    faststart = im >= 0 && id >= 0 && im < id;
+                    int mc = 0; foreach (string t in types) if (t == "mdat") mc++;
+                    tailMdat = parsed && mc >= 2 && types.Count > 0 && types[types.Count - 1] == "mdat";
+                }
+            }
+            catch { }
+            r.Add(new VCheck("Faststart (moov before mdat)", faststart, order));
+            r.Add(new VCheck("Trailing junk mdat", tailMdat, tailMdat ? "second mdat after the main one" : "no trailing mdat found"));
+
+            // 6. brand isom (ffmpeg's default mp4 brand, like the RTX output)
+            Run(ffprobe, "-v error -show_entries format_tags=major_brand -of default=nw=1:nk=1 " + q, out so, out se);
+            string brand = so.Trim();
+            r.Add(new VCheck("Brand isom", brand == "isom", "major_brand: " + (brand.Length == 0 ? "?" : brand)));
+
+            return r;
+        }
+
         public static string Report(List<VCheck> checks, out bool allPass)
         {
             allPass = true;
@@ -1353,13 +1676,14 @@ namespace QualityOptimizer
         CheckBox reencode;
         NumericUpDown mbps;
         CheckBox cloneBox;
+        CheckBox passBox;
         CheckBox res4k;
         ComboBox tailMode;
 
         public MainForm()
         {
             Text = "TikTok Quality Optimizer";
-            Width = 560; Height = 730;
+            Width = 560; Height = 762;
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(24, 24, 28);
             AllowDrop = true;
@@ -1469,18 +1793,28 @@ namespace QualityOptimizer
             Controls.Add(tailMode);
             cloneBox.CheckedChanged += delegate { tailMode.Enabled = cloneBox.Checked; };
 
+            passBox = new CheckBox();
+            passBox.Text = "Clean passthrough (RTXFury 2026-11): copy + remux, NO re-encode";
+            passBox.ForeColor = Color.FromArgb(150, 215, 190);
+            passBox.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
+            passBox.SetBounds(24, 386, 510, 22);
+            Controls.Add(passBox);
+            // "pass" and "clone" are different engines: ticking one unticks the other.
+            passBox.CheckedChanged += delegate { if (passBox.Checked) cloneBox.Checked = false; };
+            cloneBox.CheckedChanged += delegate { if (cloneBox.Checked) passBox.Checked = false; };
+
             reencode = new CheckBox();
             reencode.Text = "Set video bitrate";
             reencode.ForeColor = Color.FromArgb(200, 200, 210);
             reencode.Font = new Font("Segoe UI", 9.5F);
-            reencode.SetBounds(24, 388, 130, 24);
+            reencode.SetBounds(24, 416, 130, 24);
             reencode.CheckedChanged += delegate { mbps.Enabled = reencode.Checked; };
             Controls.Add(reencode);
 
             mbps = new NumericUpDown();
             mbps.Minimum = 8; mbps.Maximum = 50; mbps.Value = 15;
             mbps.Font = new Font("Segoe UI", 9.5F);
-            mbps.SetBounds(156, 388, 50, 24);
+            mbps.SetBounds(156, 416, 50, 24);
             mbps.Enabled = false;
             Controls.Add(mbps);
 
@@ -1488,11 +1822,11 @@ namespace QualityOptimizer
             mbpsL.Text = "Mbps (default 15; use ~30-40 for 4K)";
             mbpsL.ForeColor = Color.FromArgb(150, 150, 160);
             mbpsL.Font = new Font("Segoe UI", 9F);
-            mbpsL.SetBounds(230, 391, 304, 20);
+            mbpsL.SetBounds(230, 419, 304, 20);
             Controls.Add(mbpsL);
 
             bar = new ProgressBar();
-            bar.SetBounds(24, 420, 500, 12);
+            bar.SetBounds(24, 448, 500, 12);
             bar.Style = ProgressBarStyle.Marquee;
             bar.Visible = false;
             Controls.Add(bar);
@@ -1501,7 +1835,7 @@ namespace QualityOptimizer
             status.Text = "";
             status.ForeColor = Color.FromArgb(160, 200, 160);
             status.Font = new Font("Segoe UI", 9.5F);
-            status.SetBounds(24, 438, 500, 20);
+            status.SetBounds(24, 466, 500, 20);
             Controls.Add(status);
 
             report = new TextBox();
@@ -1512,7 +1846,7 @@ namespace QualityOptimizer
             report.ForeColor = Color.FromArgb(200, 210, 200);
             report.Font = new Font("Consolas", 9F);
             report.BorderStyle = BorderStyle.FixedSingle;
-            report.SetBounds(24, 462, 500, 208);
+            report.SetBounds(24, 490, 500, 208);
             Controls.Add(report);
 
             if (!Tools.Available())
@@ -1565,7 +1899,8 @@ namespace QualityOptimizer
             string file = d.FileName;
             // Use the checks for whichever method is selected (the clone checks
             // when "New TikTok method" is ticked, else the junk-method checks).
-            bool clone = cloneBox.Checked;
+            bool pass = passBox.Checked;
+            bool clone = !pass && cloneBox.Checked;
             bool noGap = tailMode.SelectedIndex != (int)Mp4.TailLayout.V3;
             Busy(true);
             SetStatus("Verifying " + Path.GetFileName(file) + " ...", false);
@@ -1575,7 +1910,7 @@ namespace QualityOptimizer
                 try
                 {
                     bool allPass;
-                    string rep = Tools.Report(clone ? Tools.VerifyClone(file, noGap) : Tools.Verify(file), out allPass);
+                    string rep = Tools.Report(pass ? Tools.VerifyPassthrough(file) : clone ? Tools.VerifyClone(file, noGap) : Tools.Verify(file), out allPass);
                     ShowVerify(Path.GetFileName(file), rep, allPass);
                 }
                 catch (Exception ex) { Fail(ex.Message); }
@@ -1600,7 +1935,8 @@ namespace QualityOptimizer
             Tools.CloneMbps = reencode.Checked ? (int)mbps.Value : 15;
             Tools.CloneMaxBox = res4k.Checked ? "2160:3840" : "1080:1920";
             Tools.CloneTail = (Mp4.TailLayout)tailMode.SelectedIndex;
-            bool clone = cloneBox.Checked;
+            bool pass = passBox.Checked;
+            bool clone = !pass && cloneBox.Checked;
             Busy(true);
             SetStatus("Working...", false);
             SetReport("");
@@ -1612,6 +1948,16 @@ namespace QualityOptimizer
                 {
                     bool allPass;
                     string rep, note;
+                    if (pass)
+                    {
+                        tmp = Tools.BuildPassthrough(input, audioPath, delegate(string m) { SetStatus(m, false); });
+                        File.Copy(tmp, outPath, true);
+                        note = "clean passthrough (RTXFury 2026-11 remux: copy + faststart, no surgery)";
+                        SetStatus("Verifying output...", false);
+                        rep = Tools.Report(Tools.VerifyPassthrough(outPath), out allPass);
+                        Done(outPath, note, rep, allPass);
+                        return;
+                    }
                     if (clone)
                     {
                         tmp = Tools.BuildClone(input, audioPath, delegate(string m) { SetStatus(m, false); });
@@ -1695,6 +2041,7 @@ namespace QualityOptimizer
             reencode.Enabled = !on;
             mbps.Enabled = !on && reencode.Checked;
             cloneBox.Enabled = !on;
+            passBox.Enabled = !on;
             res4k.Enabled = !on;
             tailMode.Enabled = !on && cloneBox.Checked;
         }
@@ -1747,6 +2094,21 @@ namespace QualityOptimizer
             // e.g. optimizer.exe -bitrate 25 -clone in.mov out.mp4
             if (clone && Tools.ReencodeMbps > 0) Tools.CloneMbps = Tools.ReencodeMbps;
 
+            // Optional leading  -passthrough / -clean  selects RTXFury's NEW
+            // method (2026-11): a clean faststart remux, NO surgery. Video is
+            // stream-copied (H.264/HEVC); audio copied if AAC-LC, else AAC-LC.
+            bool pass = false;
+            if (args.Length >= 1 && (args[0] == "-passthrough" || args[0] == "-clean" || args[0] == "/passthrough"))
+            {
+                pass = true;
+                string[] rest = new string[args.Length - 1]; Array.Copy(args, 1, rest, 0, rest.Length); args = rest;
+            }
+            if (args.Length >= 1 && (args[0] == "-force264" || args[0] == "/force264"))
+            {
+                Tools.PassthroughForceH264 = true;
+                string[] rest = new string[args.Length - 1]; Array.Copy(args, 1, rest, 0, rest.Length); args = rest;
+            }
+
             // Optional resolution for the clone engine (default 1080p, confirmed).
             // -4k caps at 2160x3840; -native keeps the source resolution. Both are
             // UNTESTED on TikTok (the proven method is 1080p).
@@ -1781,7 +2143,7 @@ namespace QualityOptimizer
             {
                 if (args.Length < 2) { Console.Error.WriteLine("usage: optimizer.exe -verify <file>"); Environment.Exit(2); }
                 bool allPass;
-                Console.WriteLine(Tools.Report(clone ? Tools.VerifyClone(args[1], noGap) : Tools.Verify(args[1]), out allPass));
+                Console.WriteLine(Tools.Report(pass ? Tools.VerifyPassthrough(args[1]) : clone ? Tools.VerifyClone(args[1], noGap) : Tools.Verify(args[1]), out allPass));
                 Console.WriteLine(allPass ? "VERDICT: all checks passed." : "VERDICT: some checks did not pass.");
                 Environment.Exit(allPass ? 0 : 1);
             }
@@ -1793,7 +2155,14 @@ namespace QualityOptimizer
                 try
                 {
                     string note;
-                    if (clone)
+                    if (pass)
+                    {
+                        string tmpp = Tools.BuildPassthrough(args[1], args[2], delegate(string m) { Console.WriteLine(m); });
+                        File.Copy(tmpp, args[3], true);
+                        if (File.Exists(tmpp)) File.Delete(tmpp);
+                        note = "clean passthrough + attached audio (RTXFury 2026-11 remux)";
+                    }
+                    else if (clone)
                     {
                         string tmpc = Tools.BuildClone(args[1], args[2], delegate(string m) { Console.WriteLine(m); });
                         File.Copy(tmpc, args[3], true);
@@ -1810,7 +2179,7 @@ namespace QualityOptimizer
                     }
                     Console.WriteLine("OK: " + args[3] + "  (" + note + ")");
                     bool allPass;
-                    Console.WriteLine(Tools.Report(clone ? Tools.VerifyClone(args[3], noGap) : Tools.Verify(args[3]), out allPass));
+                    Console.WriteLine(Tools.Report(pass ? Tools.VerifyPassthrough(args[3]) : clone ? Tools.VerifyClone(args[3], noGap) : Tools.Verify(args[3]), out allPass));
                     Console.WriteLine(allPass ? "VERDICT: all checks passed." : "VERDICT: some checks did not pass.");
                     Environment.Exit(allPass ? 0 : 1);
                 }
@@ -1827,7 +2196,14 @@ namespace QualityOptimizer
                 try
                 {
                     string note;
-                    if (clone)
+                    if (pass)
+                    {
+                        string tmpp = Tools.BuildPassthrough(args[0], null, delegate(string m) { Console.WriteLine(m); });
+                        File.Copy(tmpp, args[1], true);
+                        if (File.Exists(tmpp)) File.Delete(tmpp);
+                        note = "clean passthrough (RTXFury 2026-11 remux: copy + faststart, no surgery)";
+                    }
+                    else if (clone)
                     {
                         string tmpc = Tools.BuildClone(args[0], null, delegate(string m) { Console.WriteLine(m); });
                         File.Copy(tmpc, args[1], true);
@@ -1844,7 +2220,7 @@ namespace QualityOptimizer
                     }
                     Console.WriteLine("OK: " + args[1] + "  (" + note + ")");
                     bool allPass;
-                    Console.WriteLine(Tools.Report(clone ? Tools.VerifyClone(args[1], noGap) : Tools.Verify(args[1]), out allPass));
+                    Console.WriteLine(Tools.Report(pass ? Tools.VerifyPassthrough(args[1]) : clone ? Tools.VerifyClone(args[1], noGap) : Tools.Verify(args[1]), out allPass));
                     Console.WriteLine(allPass ? "VERDICT: all checks passed." : "VERDICT: some checks did not pass.");
                     Environment.Exit(allPass ? 0 : 1);
                 }

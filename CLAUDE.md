@@ -30,6 +30,29 @@ research notes below (sections 1–10) are the specification it is built from.
 > See "How other accounts keep quality" below. The clone engine stays the
 > confirmed method only because no trick-free upload has yet been served
 > `original` on this account.
+>
+> **Update (2026-11-15): RTXFury itself dropped the surgery.** A new RTXFury
+> output (`rtx-optimized-*.mp4`) is a clean faststart remux — video
+> stream-copied (no re-encode), 1 video + 1 audio, brand isom, moov-first, no
+> clone/tail/two-description — structurally identical to @someplace505's served
+> originals. The app now has a **`-passthrough` / "Clean passthrough" mode** that
+> reproduces it, so a clean-remux upload can be A/B'd against the clone and a
+> plain upload on the same account. NOT yet upload-confirmed here. See "RTXFury
+> pivot" below.
+>
+> **Correction (2026-11-15, later): the newest RTXFury output is NOT fully
+> clean — it keeps a stealth junk audio tail.** A newer sample
+> (`rtx-optimized-dd39.mp4`) is the same clean faststart remux (video
+> stream-copied byte-for-byte, 1 video + 1 audio, moov-first, brand isom) BUT
+> its **last 4 audio frames are overwritten with a fixed 15-byte undecodable
+> constant and relocated into a trailing 68-byte `mdat`** after the main one (5
+> AAC decode errors on the tail). The audio frame count and timeline are
+> preserved (no end gap), so the file still parses as a clean 1v+1a file. So
+> RTXFury did NOT drop the surgery; it made it stealthier — a corrupt audio tail
+> in the real track instead of the old separate junk track. **The passthrough
+> engine now reproduces this by default** (`Mp4.AddJunkAudioTail`); the earlier
+> "fully clean" read came from the older `ca17` sample, which lacked the tail.
+> Still NOT upload-confirmed. See "RTXFury pivot" below.
 
 **What it does.** Takes an input video and writes a new MP4 that carries the
 container signature studied below — a third audio track whose tail is
@@ -51,6 +74,7 @@ there is no quality loss from this tool.
 | `strip_metadata.py` | Python version of the stripper (needs Python; none installed here). |
 | `build.bat` | Rebuilds `optimizer.exe` and `stripper.exe` from source. |
 | `tiktok-passthrough.user.js` | **Experimental** Tampermonkey userscript: strips TikTok's cloud-edit/canvas flags + `post_type 2→3` on the web publish call. For A/B testing passthrough; not part of the app. See 2026-11-14 notes. |
+| `extension/` | **Browser extension (MV3)** that recreates the Editing News two-part system: intercepts the TikTok web upload and swaps in an `optimizer.exe -clone` output via a native-messaging host (`extension/host/clone_host.exe`), plus the userscript's flag-strip. Local only; no backend. See "Browser extension" below and `extension/README.md`. |
 | `README.txt` | Short end-user instructions. |
 | `CLAUDE.md` | This file. |
 
@@ -85,6 +109,15 @@ there is no quality loss from this tool.
    but are not usable: **keep** was re-encoded by TikTok (2026-11-14) and
    **front** loses its audio in a local player. Use v3. See "End gap
    (2026-11-13)" below.
+9. **Clean passthrough (RTXFury 2026-11)** (off by default; mutually exclusive
+   with "New TikTok method") switches to the **passthrough engine**: no video
+   re-encode when the source is already H.264/HEVC + AAC-LC — it stream-copies
+   both and re-muxes to a clean faststart file (brand isom, moov first), then
+   reproduces the newest RTXFury output (`dd39`) by overwriting the **last 4
+   audio frames with a 15-byte undecodable constant in a trailing `mdat`** (count
+   and duration preserved, so no end gap). HE-AAC audio is re-encoded to AAC-LC
+   (where RTXFury rejects it). For an A/B against the clone and a plain upload.
+   NOT upload-tested on this account. See "RTXFury pivot" below.
 
 **Requirements.** `ffmpeg.exe` and `ffprobe.exe` must be on `PATH` (already
 installed on this machine via WinGet) **or** sitting next to `optimizer.exe`.
@@ -107,7 +140,16 @@ checks pass:
 - With `-clone`, add `-tail v3|keep|front` to pick the tail layout (default
   `v3`; see "End gap (2026-11-13)"). With `-verify`, `-tail keep|front` turns
   the end-gap line into a real check.
-- Flag order: `-bitrate N`, `-clone`, `-4k`/`-native`, `-tail X`, then the
+- Prefix any convert form with `-passthrough` (or `-clean`) for RTXFury's NEW
+  method (2026-11, `dd39`): a clean faststart remux **plus a junk audio tail**.
+  Video is stream-copied when already H.264/HEVC (zero re-encode), audio copied
+  if AAC-LC else re-encoded to AAC-LC; brand isom, moov first; then the last 4
+  audio frames become a 15-byte undecodable constant in a trailing `mdat` (count
+  and duration preserved). Add `-force264` to convert HEVC → H.264.
+  `optimizer.exe -passthrough in.mov out.mp4`,
+  `optimizer.exe -passthrough -verify out.mp4`,
+  `optimizer.exe -passthrough -mux video.mp4 song.mp3 out.mp4`.
+- Flag order: `-bitrate N`, `-clone` or `-passthrough`, `-force264`, `-4k`/`-native`, `-tail X`, then the
   command, e.g. `optimizer.exe -bitrate 45 -clone -4k in.mov out.mp4` or
   `optimizer.exe -clone -tail keep -mux video.mp4 song.mp3 out.mp4`.
   Note: the exe is a GUI-subsystem
@@ -558,6 +600,160 @@ one open empirical test is whether `post_type 2→3` alone flips the server to
 passthrough: A/B a clean clip (no added sound) with vs without the userscript and
 read `encodedType`. `tiktok-passthrough.user.js` (new, experimental, not wired
 into the app) reproduces the flag-strip for that test.
+
+## Browser extension — upload interceptor (built 2026-11-15)
+
+`extension/` recreates the Editing News **two-part** architecture (the one the
+`tiktok-quality` / EditingSource repos describe) but drives our **confirmed**
+clone engine instead of the dead junk method:
+
+1. **File interception + swap.** `content-intercept.js` (MV3 content script,
+   isolated world) catches the video on the TikTok web uploader — `change` on the
+   file `<input>` and `drop`, both capture-phase at `document_start`, before
+   TikTok reads it — and swaps the optimized bytes back into the input.
+2. **Flag-strip.** `inject-flagstrip.js` (MAIN world) is the userscript's
+   `fetch`/XHR publish-payload rewrite (`post_type 2→3`, drop `canvas_config` /
+   `vedit_segment_info`), toggled from the popup.
+
+**Why a native host, not a pure-JS in-page patcher.** Our confirmed method
+RE-ENCODES to H.264 (needs ffmpeg), which can't run cheaply in a page. So the
+extension does NOT port the atom/ghost-frame surgery to JS — that is the junk
+method TikTok killed on 11-08. Instead `background.js` (service worker) pipes the
+bytes over Chrome native messaging to `host/clone_host.exe` (C#, built by
+`install_host.ps1` with the in-box csc, referencing `System.Web.Extensions.dll`
+for JSON), which shells out to the existing `optimizer.exe -clone` in the exact
+confirmed flag order and streams the patched MP4 back. The popup exposes
+resolution / bitrate / tail / flag-strip plus a native-host health check.
+
+Native-messaging detail: host→browser messages are capped at 1 MB, so the file is
+chunked both ways (512 KiB raw per frame), and the host emits `{t:"progress"}`
+heartbeats during the encode so the MV3 service worker is not idle-killed on a
+long 4K job. The extension fails **open** — if optimizing errors, the original is
+uploaded, so a post always goes out.
+
+**Install:** load `extension/` unpacked, copy the extension ID, run
+`install_host.ps1 -ExtensionId <id>`, reload. Full steps in `extension/README.md`.
+
+**Status (2026-11-15): host↔optimizer path VERIFIED locally; NOT yet tested by
+upload.** A `clone_host.exe --run` self-test on a generated 3 s 640×360 clip ran
+`optimizer.exe -clone`, exited 0 (all clone checks passed) in 1.5 s, and produced
+a 1 video + 2 audio file that `-clone -verify` passes. The browser half (content
+script interception, native-messaging bridge, file swap) is written and compiles
+but has NOT been run against a live TikTok page here, and nothing has been posted.
+
+**Caveat — this does not settle whether the surgery is the lever.** Per the
+2026-11-14 notes above, clean trick-free files are being served `original`, so the
+file method may no longer be what earns it. The extension is built so the
+flag-strip can be A/B tested alone (popup: turn "Optimize uploaded file" off,
+leave "Strip cloud-edit flags" on) — the one open empirical test — without giving
+up the confirmed file method when you want it.
+
+## RTXFury pivoted off the surgery — clean-remux "passthrough" (2026-11-15)
+
+A new RTXFury output (`rtx-optimized-ca17.mp4`, from "RTX Server Optimize"),
+reverse-engineered against its source (`americangirl.mp4`, H.264 1440×1080 +
+AAC-LC stereo): **RTXFury has abandoned the clone surgery.** The new output is a
+clean faststart remux:
+
+- **video STREAM-COPIED** — the H.264 elementary stream is byte-identical to the
+  input, and the bitrate (13,837,567 bps), frame count (316) and the source
+  `Mainconcept` handler name are all preserved. No re-encode, zero loss. (It
+  re-encodes HEVC → H.264; `americangirl` was already H.264, so it was copied.)
+- **1 video + 1 audio** (box tree: 2 trak, 1 mp4a, 1 esds, 1 mdat) — no clone
+  track, no two-sample-description, no second `mdat`, no trailing junk, no RTX
+  `©too` tag.
+- audio stream-copied (824 → 823 frames, last one trimmed to align), brand
+  **mp42 → isom** (+ `isomiso2avc1mp41`), `moov` moved to the front
+  (`ftyp · moov · free · mdat`), `mvhd` v0 real duration, `Lavf60` mux.
+- this also explains "fixes sound detection": it now REQUIRES AAC-LC input and
+  rejects HE-AAC (e.g. p77), because it copies the audio instead of re-encoding.
+
+This is the **same clean profile as @someplace505's served originals** (1 video
++ 1 audio, full handlers, no tricks). Three signals now agree — our flag-strip
+test came back `normal`, @someplace505's clean files are served `original`, and
+RTXFury (which invented the surgery) has dropped it — so the current play is most
+likely a **clean, non-re-encoded H.264/AAC-LC faststart file**, with eligibility
+decided server-side.
+
+**New mode: `-passthrough` / "Clean passthrough".** The app reproduces this with
+ffmpeg (`Tools.BuildPassthrough` in `src/Optimizer.cs`): stream-copy the video
+when it is already H.264/HEVC (else re-encode to H.264; `-force264` forces it for
+HEVC), copy the audio when it is already AAC-LC (else re-encode to AAC-LC, so
+HE-AAC sources work where RTXFury rejects them), `-movflags +faststart`, brand
+isom, `-map_metadata 0`. No container surgery. `Tools.VerifyPassthrough` checks 1
+video + 1 audio, video intact (H.264/HEVC, 0 decode errors), audio AAC-LC, moov
+before mdat, single mdat / no junk, brand isom. GUI: the "Clean passthrough"
+checkbox (mutually exclusive with "New TikTok method"); CLI: `-passthrough` /
+`-clean` / `-force264`.
+
+Verified locally 2026-11-15: on an H.264 + AAC-LC clip the output video is
+byte-identical to the source (stream-copied), the layout is
+`ftyp · moov · free · mdat`, and all `VerifyPassthrough` checks pass; the clone
+engine still verifies clean (no regression).
+
+**Status: NOT upload-tested on this account.** The point is the A/B — clean
+passthrough vs the clone surgery vs a plain upload, same account, reading
+`encodedType`. If passthrough is served `original`, it beats the clone (no
+re-encode, no end-gap); if it comes back `normal` like the earlier clean uploads
+(@sylvanism_, @papercheques), the lever is account/region eligibility, which no
+file method supplies. The clone engine stays the confirmed method until this A/B
+says otherwise.
+
+### The newest RTXFury kept a junk audio tail (2026-11-15, `dd39`) — VERIFIED
+
+A newer real RTXFury output, `rtx-optimized-dd39.mp4` (from source
+`exclusive.mp4`, H.264 Main 1440×1080 4:3 + AAC-LC), shows the "fully clean"
+read above was premature. It is still a clean faststart remux — the **video
+elementary stream is byte-identical to the source** (same MD5, 260 packets, no
+re-encode), 1 video + 1 audio, brand isom, moov moved to front with the
+stale-moov `free` stub kept — but it carries one deliberate piece of surgery the
+`ca17` sample did not:
+
+- **Box layout:** `ftyp · moov · free(=stale moov) · free(8) · mdat(main) ·
+  mdat(68)`. The source ended cleanly at its single `mdat`, so RTXFury **added**
+  the trailing 68-byte `mdat`.
+- **The trailing `mdat` = the last 4 audio frames, corrupted.** Source and
+  output both have **678 audio packets** (count preserved). In the output the
+  last 4 packets are **15 bytes each, at the trailing mdat**, each the fixed
+  constant `a0 98 00 40 01 28 00 64 00 00 03 50 00 00 38`. Decoding the audio
+  track yields **5 errors** — the tail is undecodable. ffprobe still reads all
+  678 packets (the audio edit list is kept and covers them), so the file parses
+  as a clean 1v+1a file; only a decoder that actually demuxes the tail fails.
+- **No end gap:** frame count and timeline are unchanged, so unlike the clone
+  v3 the file ends with the last video frame (format duration = source).
+
+So the mechanism is a stealthier revival of the dead junk-track idea: instead of
+a whole third track of junk (which the served-`original` clean files lack), it
+poisons the last few frames of the *real* audio track and relocates them to a
+trailing `mdat`. This is the one structural feature that separates a
+served-`original` RTXFury file from a plain clean remux.
+
+**App change — passthrough now reproduces it (`Mp4.AddJunkAudioTail`).** After
+the clean ffmpeg remux, the passthrough engine rewrites the audio track to one
+sample per chunk, sets the last 4 stsz entries to 15, appends a trailing `mdat`
+of 4 × the 15-byte constant, and points those 4 samples at it (moov is at the
+front, so the resized moov's chunk offsets are re-derived; `stts`, the edit list
+and sample groups are untouched, so count and duration are preserved). It fails
+**open** — if the surgery throws, the clean file is kept, so a post always has a
+valid file. `VerifyPassthrough` now expects the tail: "Audio junk tail (breaks
+decoders)" wants > 0 decode errors and "Trailing junk mdat" wants a second
+`mdat` after the main one; "Audio is AAC-LC" checks codec/profile only.
+
+Verified locally 2026-11-15 on the user's upscaled 4K source
+(`exclusive_2x_2880x2160_prob-3.mp4`, H.264 Constrained Baseline 2880×2160 4:3):
+output video stream-copied byte-for-byte (MD5 match), 677→677 audio packets,
+last 4 = 15 bytes in a **68-byte trailing `mdat` byte-identical to `dd39`'s**, 5
+decode errors on the tail, format duration = source (no end gap), all 7
+`VerifyPassthrough` checks pass. Still NOT upload-tested. The earlier `ca17`
+passthrough (truly clean, no tail) is superseded by this.
+
+**Caveat (resolution/profile confound).** The user's "doesn't work" file is
+2880×2160 (4:3) **Constrained Baseline**, upscaled 2×; the working `dd39` is
+1440×1080 **Main**. If a fixed-with-tail 4K upload still comes back `normal`, the
+lever may be the resolution/profile or account/region eligibility, not the tail.
+The junk tail was unambiguously missing from the old passthrough output and
+present in every served-`original` RTXFury file, so it is the right first fix,
+but only an upload reading `encodedType` settles it.
 
 ---
 
