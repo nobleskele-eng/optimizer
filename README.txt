@@ -33,11 +33,12 @@ The New TikTok method (v3) leaves about 0.4 s of silence with no picture at
 the end of every file, which shows up as a pause before the video loops. The
 "End-gap fix" dropdown picks how the tool builds that part of the file:
   - Off - v3                  the method confirmed by upload (has the pause)
-  - Keep edit lists           no pause; NOT upload-tested yet
-  - Silent frames at start    no pause; NOT upload-tested yet
-Test a no-pause option on one post before relying on it: it only counts if
-TikTok serves the file at original quality. The report shows an "End gap" line
-(how long the file runs after the last video frame).
+  - Keep edit lists           no pause, but FAILED: TikTok re-encoded the
+                              upload to 540p (2026-11-14). Do not use.
+  - Silent frames at start    no pause, but BROKEN: plays once with no audio
+                              in a local player, then stops. Do not use.
+Use "Off - v3" for uploads. The report shows an "End gap" line (how long the
+file runs after the last video frame).
 Command line:  optimizer.exe -clone -tail keep "in.mov" "out.mp4"
                (-tail v3, keep or front)
 

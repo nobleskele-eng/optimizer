@@ -21,7 +21,15 @@ research notes below (sections 1–10) are the specification it is built from.
 > `-4k`, two 2160×3840 uploads at 60 and 59.94 fps were served raw at full
 > resolution and their original frame rate. See "New clone engine" below. The
 > junk-track method described first is kept for reference but no longer works
-> on TikTok.
+> on TikTok. **End-gap fix: keep "Off - v3".** The `keep` layout was re-encoded
+> by TikTok (2026-11-14) and `front` breaks local playback.
+>
+> **Note (2026-11-14): the surgery may not be the lever.** Two current
+> @someplace505 posts were served `original` (one 4K H.264, one 1440p 10-bit HDR
+> HEVC) from clean, trick-free files; a plain upload of ours came back `normal`.
+> See "How other accounts keep quality" below. The clone engine stays the
+> confirmed method only because no trick-free upload has yet been served
+> `original` on this account.
 
 **What it does.** Takes an input video and writes a new MP4 that carries the
 container signature studied below — a third audio track whose tail is
@@ -42,6 +50,7 @@ there is no quality loss from this tool.
 | `stripper.exe` / `src/Stripper.cs` | Companion app: detects and removes app tags (Aweme, `sec_uid`, `vid:`) with `-c copy`. Run it **before** the optimizer. |
 | `strip_metadata.py` | Python version of the stripper (needs Python; none installed here). |
 | `build.bat` | Rebuilds `optimizer.exe` and `stripper.exe` from source. |
+| `tiktok-passthrough.user.js` | **Experimental** Tampermonkey userscript: strips TikTok's cloud-edit/canvas flags + `post_type 2→3` on the web publish call. For A/B testing passthrough; not part of the app. See 2026-11-14 notes. |
 | `README.txt` | Short end-user instructions. |
 | `CLAUDE.md` | This file. |
 
@@ -72,8 +81,10 @@ there is no quality loss from this tool.
    44–48 Mbps.
 8. **End-gap fix** (clone engine only; default **Off - v3**) picks where the
    clone engine puts its 16 silent tail frames. v3 leaves ~0.4 s of silence with
-   no picture at the end of every file; the other two layouts remove it but are
-   **not upload-tested**. See "End gap (2026-11-13)" below.
+   no picture at the end of every file. The other two layouts remove the gap
+   but are not usable: **keep** was re-encoded by TikTok (2026-11-14) and
+   **front** loses its audio in a local player. Use v3. See "End gap
+   (2026-11-13)" below.
 
 **Requirements.** `ffmpeg.exe` and `ffprobe.exe` must be on `PATH` (already
 installed on this machine via WinGet) **or** sitting next to `optimizer.exe`.
@@ -355,9 +366,11 @@ rate (60 and 59.94 both come back unchanged, not resampled) or a bitrate of up
 to about 48 Mbps. Caveat: the page data was read about 2 minutes (p99) and 4
 minutes (p98) after posting. That is past the 92 s point at which an earlier
 failed build already had its re-encode. A later re-check was blocked by
-TikTok's bot-check page, so it is not yet checked whether these posts stay raw
-over hours. The junk-method posts from 10-26 and 10-29 were still raw 10+ days
-later.
+TikTok's bot-check page at the time. **Re-checked 2026-11-15 01:56 UTC, about 3
+days after posting: both are still `original` / `original`**, 2160p, with
+the served size equal to the upload and empty `bitrateInfo`. p97 (nanjing first
+snow, 4K v3, posted 11-10) is also still raw. The junk-method posts from 10-26
+and 10-29 were still raw 10+ days later.
 
 The clone engine re-encodes (one generation of loss), so set a high bitrate.
 It caps at 1080p by default; for a 4K source, turn on "Allow up to 4K" (`-4k`),
@@ -416,15 +429,135 @@ on three inputs; `keep` and `front` pass all clone checks with an end gap of
 0.016 s (0.000 s with Add Song or a no-audio source), Chromium end delay within
 0.03 s of the plain file, and 0 decode errors on both audio tracks.
 
-**Status: NOT upload-tested.** Test plan: post the same edit made with `keep`
-(first, smallest change) and, if that is re-encoded, with `front`. Pass = served
-size equals the uploaded size and `bitrateInfo` is empty. Keep v3 as the
-default until one passes.
+**Status (2026-11-14): neither layout is usable. Keep v3 as the default.**
+
+**`keep`: re-encoded by upload.** p102 (gexian sky lanterns fireworks edit),
+`keep` layout with "Allow up to 4K": H.264 2160×3840, 60 fps, 45.3 Mbps,
+62,896,981 B. Posted 2026-11-15 01:50:56 UTC; page data read about 4.5 min
+later:
+
+| | Uploaded p102 (`keep`) | Served |
+|---|---|---|
+| `encodedType` / `videoQuality` | | normal / lowest |
+| `definition` / size on screen | 2160×3840 | 540p, 576×1024 |
+| Bitrate / size | 45.3 Mbps / 62,896,981 B | 1.1 Mbps / 1,546,924 B |
+| `bitrateInfo` | | one gear, `lowest_540_0` |
+
+ffprobe on p102 reads 479 of the 495 packets on each audio track: all 16 tail
+frames, including the 8 tagged with description 2, are cut by the edit list.
+(The v3 p98 reads all 423 of 423.) This fits the risk named above: if TikTok
+reads the file the way ffmpeg does, a `keep` file never shows it the
+config switch. INFERENCE: TikTok's reader must actually reach the
+description-2 frames, so the tail has to be inside the played timeline.
+
+Control, read the same day: p98 and p99 (v3, posted 11-12 02:54 / 02:57 UTC)
+are still `original` / `original`, 2160p, served size equal to the upload,
+empty `bitrateInfo`, about 3 days after posting. p97 (nanjing first snow, also a
+4K v3 clone, 55,010,915 B, posted 11-10 04:18 UTC) is `original` too, as is the
+10-29 junk-method p93. Not ruled out: no v3 file has been uploaded since 11-12,
+so a new TikTok change between 11-12 and 11-15 would also explain p102. The
+next v3 upload settles it.
+
+**`front`: broken locally (user report, 2026-11-14).** In a local player it
+plays once with no audio and then stops, so it was not uploaded. INFERENCE
+(not reproduced here): the real audio track now switches sample description
+(1 → 2 → 1) before the song starts, and a player that cannot change audio
+config mid-track (Windows Media Foundation is the likely one) drops the audio
+for the whole song. In v3 the switch comes after the song, so it does no harm.
+
+**What is left for a gap fix.** The tail has to stay after the song and be
+played (v3 timing). Two ideas keep v3's audio structure:
+- trim the song by the tail's length (~0.39 s) during the base encode, so the
+  file ends with the last video frame. The picture plays to the end; the last
+  ~0.39 s is silent. A v3 file whose source audio is shorter than its video
+  already looks like this, so it is the smallest change.
+- stretch the last video frame over the tail, so the picture holds instead of
+  going black. Silence stays, and the video track changes.
+Neither is built or tested.
 
 **Sound ID (inconclusive).** Raw-served junk-method posts: 10-26 (p91) got an
 identified sound, 10-29 (p93) did not. Same structure, different outcome, so
 sound identification does not show anything about the file; it is probably
 down to the song itself (or timing).
+
+## How other accounts keep quality — it is not our surgery (2026-11-14)
+
+Pulled and dissected three current same-day posts (yt-dlp; served size equals
+TikTok's reported size, so these are byte-exact served containers):
+
+| Post | Account | How posted | TikTok label | Served |
+|------|---------|-----------|--------------|--------|
+| V1 `7708099…308` | @someplace505 | editingnews | `original`/`original` | 4K H.264 2160×3840, 26 Mbps |
+| V2 `7708031…798` | @someplace505 | editingnews | `original`/`original` | 1440×2560 **10-bit HDR HEVC**, 14.5 Mbps |
+| V3 `7708221…709` | @sylvanism_ (our test) | plain web upload, HD on | `normal`/`normal` | 720p H.264 + HE-AACv2, re-encoded |
+
+**The served originals carry NONE of our fingerprints (VERIFIED).** V1 and V2 are
+ordinary `ftyp·moov·free·mdat` faststart files: 1 video + 1 audio, full
+`VideoHandler`/`SoundHandler` names (45-byte hdlr), real `mvhd` duration, movie
+`udta` present — no junk track, no clone, no second `mdat`, no two-sample-
+description, no trailing junk, no silent tail. A box-by-box diff against our
+confirmed-working p98 v3 clone shows *ours* has three deliberate additions (the
+clone audio track, the second-`mdat` tail with the audio edit list stripped, the
+two `mp4a` sample descriptions) that theirs lack — yet both are served raw. So the
+container surgery is **not** what earns original serving, and it is exactly what
+causes the end-gap (their clean files have no tail and loop seamlessly).
+
+- V2's served file carries TikTok's own `©too` JSON with **`te_is_reencode:0`**
+  and `hdr_bit:10` — TikTok itself saying it did not re-encode a 10-bit HDR HEVC.
+- V1 kept the uploader's plain `©too = Lavf60.16.100` (an ffmpeg mux).
+- `encodedType`/`videoQuality` read `original` for V1 (empty `bitrateInfo`) and V2
+  (single `original_1440_0` gear); V3 reads `normal` (`normal_720_0`).
+- Page data exposes **no account `region`** (checked all ~33 author keys); served
+  CDN hosts are `v16/v19-webapp-prime.tiktok.com` — a quality tier, not a country.
+
+**A served `vid:` tag is TikTok's re-encode stamp, not a stripper miss (VERIFIED).**
+Only the re-encoded V3 carries `vid:`/`vid_md5`/`encoder`, in TikTok's server
+`keys`/`mdta` layout muxed by ByteDance `Lavf58.76.100`. V1/V2 (original) have
+none. Our stripper was run on V3's served file: it detects the `vid:` and removes
+it cleanly (0 decode errors, packets identical to source, re-check reports CLEAN).
+TikTok writes a fresh `vid:` whenever it re-encodes, so a served `vid:` means
+"this was re-encoded", and stripping the source cannot prevent it.
+
+## editingnews is an upload-time extension, not a file method (2026-11-14)
+
+editingnews.com ships as the Chrome extension **"Editing News X re:TikTok"** /
+"TikTok Enhancer" — it acts at upload time on tiktok.com. Its own package could
+not be pulled (Chrome listing unreachable / likely removed; not installed
+locally), but the free sibling add-on **"Maska TikTok Upload Method"** (Firefox
+AMO, downloadable) lays the whole category's method bare, and it is **client-side
+with no backend**:
+
+1. a `window.fetch` hook that catches TikTok's publish request and strips the
+   server-edit flags — deletes `vedit_segment_info`/`canvas_config`/`draft`, sets
+   `cloud_edit_is_use_video_canvas=false`, changes `post_type` 2→3;
+2. a light MP4 metadata inject (an `©ART` brand tag — V2's `©ART="editingnews.com"`
+   is the same move; Maska's is `"Tiktok: Maskafr"`);
+3. shoving the file into TikTok's `input[type=file]` via the native setter.
+
+Maska hard-caps uploads at 1080p (it blocks 1440p/4K); editingnews allows 4K/HDR,
+so it is a more refined version of the same idea.
+
+**Live capture of TikTok Studio's own upload (2026-11-14, signed in; nothing was
+posted — the publish call was intercepted and blocked).** Every flag above exists
+in TikTok's current uploader JS, and the real publish payload (`POST
+/tiktok/web/project/post/v1/`) for a plain 1440×2560 upload shows:
+
+- **no "serve original / no-transcode" field anywhere** — quality is a server-side
+  decision, not a client-settable flag;
+- `cloud_edit_is_use_video_canvas` is **already `false`** and there is **no
+  `canvas_config`** — so the Maska flag-strip is a **no-op** unless you used
+  TikTok's in-page editor; the only real change it makes is `post_type` 2→3,
+  effect on the server transcode **unproven**;
+- adding a TikTok library sound forces a re-encode on its own.
+
+**INFERENCE.** The flag-strip is copyable but very likely **insufficient** on its
+own: there is no client switch for original serving, and this account re-encodes
+clean high-res already. editingnews's real edge is most plausibly **account /
+region eligibility** (± a file-prep step), which a userscript cannot supply. The
+one open empirical test is whether `post_type 2→3` alone flips the server to
+passthrough: A/B a clean clip (no added sound) with vs without the userscript and
+read `encodedType`. `tiktok-passthrough.user.js` (new, experimental, not wired
+into the app) reproduces the flag-strip for that test.
 
 ---
 
